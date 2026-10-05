@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """flagctl.py 的命令行回归测试。
 
-覆盖本地布尔开关 set/get 在进程间的持久化行为，以及 set 的输入校验：
+覆盖本地布尔开关 set/get/unset 在进程间的持久化行为与输入校验：
 
 * 合法设置跨进程持久化、覆盖写、环境之间互不影响；
 * 环境名两端空白按去除空白后的名称落库；
@@ -9,6 +9,9 @@
 * get 在四种数据库状态下的行为：有效库缺 flags 表、flags 表无对应
   环境记录（VALUE_NOT_SET），父目录不存在、目标为普通文本文件
   （STORAGE_ERROR），且读取前后相关数据与文件状态保持不变；
+* unset 撤销 dev/new_ui 记录（原值 true 与 false 均可），qa 记录
+  不受影响，重复撤销报 VALUE_NOT_SET 且不重建记录；
+* unset 在四种数据库状态下的行为与现场保持（同 get 的状态划分）；
 * EMPTY_ENV / UNKNOWN_KEY / INVALID_BOOL 的拒绝顺序与输出协议。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
@@ -56,6 +59,19 @@ class FlagctlCliTestCase(unittest.TestCase):
 
     def get_flag(self, db, env, key):
         return self.run_flagctl(db, "get", env, key)
+
+    def unset_flag(self, db, env, key):
+        return self.run_flagctl(db, "unset", env, key)
+
+    def read_flags_rows(self, db):
+        """返回 flags 表全部 (env, key, value) 行（按主键升序）。"""
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute(
+                "SELECT env, key, value FROM flags ORDER BY env, key"
+            ).fetchall()
+        finally:
+            conn.close()
 
     def assertCommandOk(self, proc, output):
         """退出 0、stdout 严格为 output 加换行、stderr 为空。"""
@@ -238,16 +254,6 @@ class TestGetStorageStates(FlagctlCliTestCase):
             conn.close()
         return [row[0] for row in rows]
 
-    def read_flags_rows(self, db):
-        """返回 flags 表全部 (env, key, value) 行（按主键升序）。"""
-        conn = sqlite3.connect(db)
-        try:
-            return conn.execute(
-                "SELECT env, key, value FROM flags ORDER BY env, key"
-            ).fetchall()
-        finally:
-            conn.close()
-
     def test_valid_db_without_flags_table_reports_value_not_set(self):
         # 有效 SQLite 库只含无关表：报 VALUE_NOT_SET，且不新增 flags 表、
         # 原有表与数据保持不变。
@@ -312,6 +318,219 @@ class TestGetStorageStates(FlagctlCliTestCase):
             fh.write(content)
 
         proc = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        with open(db, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), content)
+
+
+class TestUnset(FlagctlCliTestCase):
+    """unset 撤销已保存的开关记录：dev/new_ui 与 qa/new_ui 为固定样例。
+
+    每个用例在子进程调用之外直接读库核对目标记录确实消失，
+    避免把“值被改成 false”误当成“设置被删除”。
+    """
+
+    def test_unset_true_removes_dev_record(self):
+        # dev/new_ui=true、qa/new_ui=false：撤销 dev 后记录消失，qa 保持 false。
+        db = self.db_path("unset_true")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+
+        self.assertCommandOk(self.unset_flag(db, "dev", "new_ui"), "unset")
+
+        self.assertEqual(
+            self.read_flags_rows(db), [("qa", "new_ui", "false")],
+            "dev 记录必须被删除而不是改成 false 保留",
+        )
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+    def test_unset_false_removes_dev_record(self):
+        # dev/new_ui=false、qa/new_ui=true：原值为 false 的记录同样可撤销。
+        db = self.db_path("unset_false")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+
+        self.assertCommandOk(self.unset_flag(db, "dev", "new_ui"), "unset")
+
+        self.assertEqual(
+            self.read_flags_rows(db), [("qa", "new_ui", "true")],
+            "dev 记录必须被删除而不是保留原值 false",
+        )
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+    def test_unset_env_surrounding_whitespace_matches_dev(self):
+        # 带两端空白的环境名命中同一条 dev 记录。
+        db = self.db_path("unset_whitespace")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+
+        self.assertCommandOk(self.unset_flag(db, "  dev  ", "new_ui"), "unset")
+
+        self.assertEqual(self.read_flags_rows(db), [])
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+
+    def test_unset_twice_reports_value_not_set(self):
+        # 已撤销的记录再次 unset：报 VALUE_NOT_SET，不重建记录、不影响 qa。
+        db = self.db_path("unset_twice")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        self.assertCommandOk(self.unset_flag(db, "dev", "new_ui"), "unset")
+
+        self.assertCommandError(self.unset_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+
+        self.assertEqual(
+            self.read_flags_rows(db), [("qa", "new_ui", "true")],
+            "重复 unset 不得重新创建 dev 记录或改动 qa",
+        )
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+
+class TestUnsetValidation(FlagctlCliTestCase):
+    """unset 的输入校验：拒绝不得创建数据库或改动已有记录。"""
+
+    def assert_unset_rejected_on_fresh_path(self, label, env, key, code):
+        """全新路径上拒绝撤销：报错且不留下数据库文件。"""
+        db = self.db_path(label)
+        self.assertFalse(os.path.exists(db))
+        proc = self.unset_flag(db, env, key)
+        self.assertCommandError(proc, code)
+        self.assertFalse(os.path.exists(db), "校验失败不得创建数据库文件: %s" % db)
+
+    def assert_unset_rejected_keeps_records(self, label, env, key, code):
+        """已存 dev=false 的库上拒绝撤销：报错且既有记录保持不变。"""
+        db = self.db_path(label)
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        proc = self.unset_flag(db, env, key)
+        self.assertCommandError(proc, code)
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "false")])
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+
+    def test_empty_env_rejected(self):
+        self.assert_unset_rejected_on_fresh_path(
+            "fresh_empty_env", "", "new_ui", "EMPTY_ENV"
+        )
+        self.assert_unset_rejected_keeps_records(
+            "kept_empty_env", "", "new_ui", "EMPTY_ENV"
+        )
+
+    def test_whitespace_only_env_rejected(self):
+        self.assert_unset_rejected_on_fresh_path(
+            "fresh_blank_env", "   ", "new_ui", "EMPTY_ENV"
+        )
+        self.assert_unset_rejected_keeps_records(
+            "kept_blank_env", "   ", "new_ui", "EMPTY_ENV"
+        )
+
+    def test_unknown_key_rejected(self):
+        self.assert_unset_rejected_on_fresh_path(
+            "fresh_unknown_key", "dev", "other_key", "UNKNOWN_KEY"
+        )
+        self.assert_unset_rejected_keeps_records(
+            "kept_unknown_key", "dev", "other_key", "UNKNOWN_KEY"
+        )
+
+    def test_empty_env_takes_precedence_over_unknown_key(self):
+        # 环境名与键同时不合法：先报告 EMPTY_ENV。
+        self.assert_unset_rejected_on_fresh_path(
+            "fresh_order_env", "", "bad_key", "EMPTY_ENV"
+        )
+        self.assert_unset_rejected_keeps_records(
+            "kept_order_env", "", "bad_key", "EMPTY_ENV"
+        )
+
+
+class TestUnsetStorageStates(FlagctlCliTestCase):
+    """unset 在四种数据库状态下的退出码、输出协议与现场保持。
+
+    统一撤销 dev/new_ui：前三种状态（数据库文件缺失、有效库缺 flags 表、
+    flags 表无 dev 记录）报 VALUE_NOT_SET；后两种（父目录不存在、目标为
+    普通文本文件）报 STORAGE_ERROR。每个用例同时核对前后文件与数据。
+    """
+
+    def read_table_names(self, db):
+        """返回数据库中全部用户表名（升序）。"""
+        conn = sqlite3.connect(db)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            ).fetchall()
+        finally:
+            conn.close()
+        return [row[0] for row in rows]
+
+    def test_missing_db_reports_value_not_set(self):
+        # 父目录存在但数据库文件尚未创建：报 VALUE_NOT_SET，文件仍不存在。
+        db = self.db_path("missing")
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(db))
+
+        proc = self.unset_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "VALUE_NOT_SET")
+        self.assertFalse(os.path.exists(db), "撤销缺失数据库不得创建文件: %s" % db)
+
+    def test_valid_db_without_flags_table_reports_value_not_set(self):
+        # 有效 SQLite 库只含无关表：报 VALUE_NOT_SET，且不新增 flags 表、
+        # 原有表与数据保持不变。
+        db = self.db_path("no_flags_table")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+                )
+                conn.execute("INSERT INTO notes (text) VALUES ('sample note')")
+        finally:
+            conn.close()
+        self.assertEqual(self.read_table_names(db), ["notes"])
+
+        proc = self.unset_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "VALUE_NOT_SET")
+
+        self.assertEqual(self.read_table_names(db), ["notes"])
+        conn = sqlite3.connect(db)
+        try:
+            notes = conn.execute("SELECT id, text FROM notes").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(notes, [(1, "sample note")])
+
+    def test_flags_table_without_dev_row_reports_value_not_set(self):
+        # flags 表只有 qa/new_ui=false：撤销 dev 报 VALUE_NOT_SET，
+        # qa 记录保持 false，且不新增 dev 记录。
+        db = self.db_path("only_qa_row")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "false")])
+
+        proc = self.unset_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "VALUE_NOT_SET")
+
+        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "false")])
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+    def test_missing_parent_directory_reports_storage_error(self):
+        # 父目录不存在：报 STORAGE_ERROR，且不创建目录或文件。
+        missing_dir = os.path.join(self.tmpdir, "no_such_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+
+        proc = self.unset_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_plain_text_file_reports_storage_error(self):
+        # 目标是已存在的普通文本文件而非 SQLite 库：报 STORAGE_ERROR，
+        # 原文件内容保持原样。
+        db = self.db_path("plain_text")
+        content = "this is not a sqlite database\njust fictional config\n"
+        with open(db, "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+        proc = self.unset_flag(db, "dev", "new_ui")
         self.assertCommandError(proc, "STORAGE_ERROR")
 
         with open(db, "r", encoding="utf-8") as fh:
