@@ -6,6 +6,9 @@
 * 合法设置跨进程持久化、覆盖写、环境之间互不影响；
 * 环境名两端空白按去除空白后的名称落库；
 * 读取尚未创建的数据库得到 VALUE_NOT_SET 且不创建文件；
+* get 面对四种数据库状态的区别：无 flags 表、无对应环境记录
+  （均为 VALUE_NOT_SET），父目录缺失、目标非 SQLite 文件
+  （均为 STORAGE_ERROR），且读取不改变既有数据或文件；
 * EMPTY_ENV / UNKNOWN_KEY / INVALID_BOOL 的拒绝顺序与输出协议。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
@@ -17,6 +20,7 @@
 """
 
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -143,6 +147,106 @@ class TestPersistence(FlagctlCliTestCase):
         proc = self.get_flag(db, "dev", "new_ui")
         self.assertCommandError(proc, "VALUE_NOT_SET")
         self.assertFalse(os.path.exists(db), "读取缺失数据库不得创建文件: %s" % db)
+
+
+class TestGetDatabaseStates(FlagctlCliTestCase):
+    """get 面对不同数据库状态的回归测试。
+
+    统一读取 dev/new_ui，固定 VALUE_NOT_SET（库中确实没有该记录）
+    与 STORAGE_ERROR（存储不可达或不是数据库）的区别，
+    并核对读取前后库内数据或文件状态不被改变。
+    """
+
+    def table_names(self, db):
+        """返回库中全部用户表名（只读查询）。"""
+        conn = sqlite3.connect(db)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {row[0] for row in rows}
+
+    def flag_rows(self, db):
+        """返回 flags 表中全部 (env, key, value) 记录。"""
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute(
+                "SELECT env, key, value FROM flags ORDER BY env, key"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def test_db_without_flags_table_reports_value_not_set(self):
+        # 有效 SQLite 库，只有无关的 meta 表，没有 flags 表。
+        db = self.db_path("no_flags_table")
+        conn = sqlite3.connect(db)
+        with conn:
+            conn.execute(
+                "CREATE TABLE meta (name TEXT PRIMARY KEY, note TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO meta (name, note) VALUES (?, ?)",
+                ("greeting", "hello from a fictional config"),
+            )
+        conn.close()
+        self.assertEqual(self.table_names(db), {"meta"})
+
+        proc = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "VALUE_NOT_SET")
+
+        # 读取后仍无 flags 表，meta 表及其数据保持不变。
+        self.assertEqual(self.table_names(db), {"meta"})
+        conn = sqlite3.connect(db)
+        try:
+            rows = conn.execute(
+                "SELECT name, note FROM meta ORDER BY name"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(rows, [("greeting", "hello from a fictional config")])
+
+    def test_other_env_only_reports_value_not_set(self):
+        # flags 表中只有 qa/new_ui=false，没有 dev 的记录。
+        db = self.db_path("other_env_only")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        self.assertEqual(self.flag_rows(db), [("qa", "new_ui", "false")])
+
+        proc = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "VALUE_NOT_SET")
+
+        # qa 的记录仍为 false，且未新增 dev 的记录。
+        self.assertEqual(self.flag_rows(db), [("qa", "new_ui", "false")])
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+    def test_missing_parent_directory_reports_storage_error(self):
+        # 数据库路径的父目录不存在：存储不可达。
+        missing_dir = os.path.join(self.tmpdir, "no_such_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+
+        proc = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        # 读取不得创建目录或文件。
+        self.assertFalse(os.path.exists(missing_dir))
+        self.assertFalse(os.path.exists(db))
+
+    def test_plain_text_file_reports_storage_error(self):
+        # 目标路径是已存在的普通文本文件，而非 SQLite 库。
+        db = self.db_path("not_a_database")
+        content = "fictional config: new_ui=maybe\nthis is not sqlite\n"
+        with open(db, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        self.assertTrue(os.path.isfile(db))
+
+        proc = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        # 原文件内容保持原样。
+        with open(db, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), content)
 
 
 class TestSetValidation(FlagctlCliTestCase):
