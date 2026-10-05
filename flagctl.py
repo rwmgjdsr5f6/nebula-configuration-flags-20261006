@@ -4,6 +4,7 @@
 用法:
     python flagctl.py --db <数据库文件> set <环境名> <键名> <true|false>
     python flagctl.py --db <数据库文件> get <环境名> <键名>
+    python flagctl.py --db <数据库文件> unset <环境名> <键名>
 
 仅使用 Python 3 标准库与 SQLite，不依赖网络或第三方包。
 """
@@ -109,6 +110,37 @@ def cmd_get(db_path, env, key):
     return row[0]
 
 
+def cmd_unset(db_path, env, key):
+    if not os.path.exists(db_path):
+        # 父目录不存在属于存储不可达；否则数据库文件不存在时不得创建文件，
+        # 视为没有任何已保存的值。
+        parent = os.path.dirname(os.path.abspath(db_path))
+        if not os.path.isdir(parent):
+            raise FlagError("STORAGE_ERROR")
+        raise FlagError("VALUE_NOT_SET")
+    conn = connect(db_path)
+    try:
+        # 不补建 flags 表：缺表与没有目标记录一样视为值未设置。
+        # 直接按主键删除，以 rowcount 是否为 0 区分记录是否存在，
+        # 无论原值是 true 还是 false 都删除该行。
+        try:
+            with conn:
+                cur = conn.execute(
+                    "DELETE FROM flags WHERE env = ? AND key = ?", (env, key)
+                )
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                raise FlagError("VALUE_NOT_SET")
+            raise FlagError("STORAGE_ERROR")
+        except sqlite3.Error:
+            raise FlagError("STORAGE_ERROR")
+    finally:
+        conn.close()
+    if cur.rowcount == 0:
+        raise FlagError("VALUE_NOT_SET")
+    return "unset"
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="flagctl.py", description="本地布尔功能开关命令行工具"
@@ -125,6 +157,10 @@ def build_parser():
     p_get.add_argument("env")
     p_get.add_argument("key")
 
+    p_unset = sub.add_parser("unset", help="撤销开关的直接设置")
+    p_unset.add_argument("env")
+    p_unset.add_argument("key")
+
     return parser
 
 
@@ -139,6 +175,8 @@ def main(argv=None):
         if args.command == "set":
             value = parse_bool(args.value)
             result = cmd_set(args.db, env, args.key, value)
+        elif args.command == "unset":
+            result = cmd_unset(args.db, env, args.key)
         else:
             result = cmd_get(args.db, env, args.key)
     except FlagError as exc:
