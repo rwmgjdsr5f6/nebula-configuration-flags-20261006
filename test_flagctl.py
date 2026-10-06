@@ -9,6 +9,11 @@
 * get 在四种数据库状态下的行为：有效库缺 flags 表、flags 表无对应
   环境记录（VALUE_NOT_SET），父目录不存在、目标为普通文本文件
   （STORAGE_ERROR），且读取前后相关数据与文件状态保持不变；
+* get 对存储值的严格校验：固定样例 dev/new_ui=yes 报 STORAGE_ERROR
+  而 qa/new_ui=false 正常输出 false，yes/TRUE/1/空串/带空白等非法
+  文本逐一报 STORAGE_ERROR 且原值原样保留，合法 true/false 正常读取，
+  只检查目标记录（其他环境的异常值不影响合法目标），flags 表缺少
+  查询所需的 value 列时报 STORAGE_ERROR；
 * unset 撤销已保存记录（原值 true 与 false 各一条固定样例）的输出
   协议：记录物理消失而非改成 false、环境名两端空白命中同一记录、
   重复撤销报 VALUE_NOT_SET 且不影响其他环境；
@@ -453,6 +458,149 @@ class TestGetStorageStates(FlagctlCliTestCase):
 
         with open(db, "r", encoding="utf-8") as fh:
             self.assertEqual(fh.read(), content)
+
+
+class TestGetStoredValueValidation(FlagctlCliTestCase):
+    """get 只接受严格文本 true/false 的回归验证。
+
+    记录存在但值不是严格的 "true"/"false" 文本时，get 必须报
+    STORAGE_ERROR（退出 2、stdout 为空、stderr 严格为
+    ``STORAGE_ERROR\\n``），不得通过大小写转换、数字转换或去除空白
+    接受，也不得输出原值；读取前后记录逐行保持不变。
+    """
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
+    def test_fixed_samples_yes_errors_false_ok_and_rows_unchanged(self):
+        # 固定样例：dev/new_ui=yes、qa/new_ui=false。读 dev 报
+        # STORAGE_ERROR，读 qa 正常输出 false；两次查询前后两条记录
+        # （含非法原值 yes）逐字节保持相同。
+        db = self.db_path("get_fixed_bad_value")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "yes"), ("qa", "new_ui", "false")],
+        )
+        before = self.read_flags_rows(db)
+        self.assertEqual(
+            before, [("dev", "new_ui", "yes"), ("qa", "new_ui", "false")]
+        )
+
+        bad = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandError(bad, "STORAGE_ERROR")
+        self.assertEqual(self.read_flags_rows(db), before)
+
+        good = self.get_flag(db, "qa", "new_ui")
+        self.assertCommandOk(good, "false")
+        self.assertEqual(self.read_flags_rows(db), before)
+
+    def test_each_invalid_stored_text_reports_storage_error(self):
+        # yes、TRUE、1、空字符串、带空格的 true 均为非法存储值：
+        # 逐一报 STORAGE_ERROR，原值原样保留，不做任何转换或去空白。
+        invalid_values = ["yes", "TRUE", "1", "", " true", "true ", " true ", "True"]
+        for index, value in enumerate(invalid_values):
+            with self.subTest(value=value):
+                db = self.db_path("get_bad_value_%d" % index)
+                self.seed_flags_table(db, [("dev", "new_ui", value)])
+
+                proc = self.get_flag(db, "dev", "new_ui")
+                self.assertCommandError(proc, "STORAGE_ERROR")
+
+                # 读取不修复数据：原值（含空串与空白）原样保留。
+                self.assertEqual(
+                    self.read_flags_rows(db), [("dev", "new_ui", value)]
+                )
+
+    def test_valid_true_and_false_read_back_verbatim(self):
+        # 合法存储值严格输出原值：true 输出 true、false 输出 false。
+        db = self.db_path("get_valid_values")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "false")],
+        )
+
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "false")],
+        )
+
+    def test_invalid_value_in_other_env_does_not_affect_target(self):
+        # 读取只检查目标记录：qa 下的非法值不影响 dev 的合法读取，
+        # 读 dev 成功后 qa 的非法原值仍原样保留。
+        db = self.db_path("get_other_env_bad")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "yes")],
+        )
+
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "yes")],
+        )
+
+        # 直接读 qa 的非法记录仍报 STORAGE_ERROR。
+        self.assertCommandError(self.get_flag(db, "qa", "new_ui"), "STORAGE_ERROR")
+
+    def test_missing_target_row_still_reports_value_not_set(self):
+        # 其他键/环境的记录（含异常值）不影响目标记录缺失的判定：
+        # dev/new_ui 不存在仍报 VALUE_NOT_SET。
+        db = self.db_path("get_target_missing")
+        self.seed_flags_table(
+            db,
+            [("qa", "new_ui", "false"), ("dev", "other_key", "true")],
+        )
+
+        proc = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "VALUE_NOT_SET")
+
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "other_key", "true"), ("qa", "new_ui", "false")],
+        )
+
+    def test_flags_table_without_value_column_reports_storage_error(self):
+        # flags 表缺少查询所需的 value 列：报 STORAGE_ERROR，表结构与
+        # 既有记录保持不变。
+        db = self.db_path("get_no_value_column")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.execute(
+                    "INSERT INTO flags (env, key) VALUES (?, ?)", ("dev", "new_ui")
+                )
+        finally:
+            conn.close()
+        self.assertEqual(self.read_flags_columns(db), ["env", "key"])
+        self.assertEqual(self.read_flags_env_key_rows(db), [("dev", "new_ui")])
+
+        proc = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_columns(db), ["env", "key"])
+        self.assertEqual(self.read_flags_env_key_rows(db), [("dev", "new_ui")])
 
 
 class TestUnsetPersistence(FlagctlCliTestCase):

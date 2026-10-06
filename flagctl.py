@@ -118,12 +118,21 @@ def cmd_set(db_path, env, key, value):
 
 
 def cmd_get(db_path, env, key):
+    """读取目标记录的布尔值，纯只读、不修复异常数据。
+
+    目标记录不存在报 VALUE_NOT_SET；记录存在但值不是严格的文本
+    true/false 时与 list 一样视为存储数据损坏，报 STORAGE_ERROR：
+    不做大小写转换、不去除空白、不输出原值。只检查目标记录，其他
+    环境的异常值不在本次读取范围内。
+    """
     with open_flag_store(db_path) as conn:
         row = conn.execute(
             "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
         ).fetchone()
     if row is None:
         raise FlagError("VALUE_NOT_SET")
+    if row[0] != "true" and row[0] != "false":
+        raise FlagError("STORAGE_ERROR")
     return row[0]
 
 
