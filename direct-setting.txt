@@ -1,0 +1,158 @@
+直接设置为 false 与未设置的区别（flagctl.py）
+=============================================
+
+本文只整理一条流程：环境上某开关被“直接设置为 false”与该开关“未设置”
+在存储与输出上的区别，以及 diff / unset 在此流程上的行为。公开命令、
+输出协议与现有 SQLite 数据格式均保持不变；flagctl 当前没有默认值，也
+没有环境间继承，键缺失就只表示“没有直接设置”，不代表 false。
+
+文中关键结论均注明对应的现有函数名称，可直接与 flagctl.py 源码核对。
+所有样例结果是“可验证的预期”，尚未在本文中宣称已经执行或实测通过。
+
+
+1. 核心结论（对照函数）
+-----------------------
+
+* false 是一个有效设置，不是“空”或“关闭状态的缺失”。
+  - set 经 parse_bool() 只接受严格文本 "true" / "false"（大小写、空白
+    不做容错），cmd_set() 以 (env, key, "false") 一行写入 flags 表。
+  - cmd_get() 对该行返回文本 false；cmd_list() 把它映射为 JSON 布尔
+    值 false。
+* “未设置”表示 flags 表里不存在该 (env, key) 行，系统不会替它补值。
+  - cmd_get() 查不到行报 VALUE_NOT_SET；cmd_list() 的结果里不出现该
+    键；cmd_diff() 用 dict.get() 取键得到 None，序列化为 null。
+  - 当前没有默认值或继承：KNOWN_KEYS 只用于判定键名是否合法，不参与
+    的键就是不存在，cmd_list() / cmd_diff() 不会填入任何默认布尔值。
+* false 与未设置因此必须明确区分：false 与 null 在 diff 中不相等，
+  属于差异；这正是 cmd_diff() 的比较语义。
+* unset 是删除记录，而不是把值改成 false。cmd_unset() 直接按主键
+  DELETE；删除后该行物理消失，事后 get 即 VALUE_NOT_SET。
+* diff 是纯只读操作：cmd_diff() 只调用 cmd_list() 做 SELECT，不创建
+  文件、表，不修改任何行；两侧的存储分类与数据校验完全复用 cmd_list()
+  与 open_flag_store()，规则只维护这一份。
+
+
+2. 固定样例
+-----------
+
+前置状态（固定）：
+
+* 数据库文件的父目录存在；
+* demo.sqlite 是有效 SQLite 库，含 flags 表，表中仅有一行
+  (env='dev', key='new_ui', value='false')；
+* 环境 qa 在 flags 表中没有任何记录（连非 new_ui 的行也没有）。
+
+flags 表结构不变：flags(env TEXT, key TEXT, value TEXT,
+PRIMARY KEY (env, key))。
+
+2.1 比较：dev 直接设置 false，qa 未设置
+
+    输入：
+        python flagctl.py --db demo.sqlite diff dev qa
+
+    预期（stdout 单行，退出码 0，stderr 为空）：
+
+        {"new_ui": {"left": false, "right": null}}
+
+  含义：
+
+  - left / right 由参数顺序决定：cmd_diff() 把第一个环境参数作为
+    left（dev），第二个作为 right（qa），调换参数左右值随之调换；
+  - false 是 dev 侧真实保存的直接设置；null 是 qa 侧没有记录，
+    不是字符串 "null"，也不是 false；
+  - 上面是 Python json.dumps 的实际输出样式（冒号、逗号后带空格）。
+    JSON 空格不影响含义，紧凑写法 {"new_ui":{"left":false,"right":null}}
+    与它表达同一结果，按 JSON 解析后应相等。
+
+2.2 撤销 dev 的直接设置
+
+    输入：
+        python flagctl.py --db demo.sqlite unset dev new_ui
+
+    预期（stdout 单行，退出码 0，stderr 为空）：
+
+        unset
+
+  效果：cmd_unset() 删除 (dev, new_ui) 这一行，而不是写入 false。
+  删除后 demo.sqlite 仍是有效库、flags 表仍在，只是该记录不存在。
+
+2.3 撤销之后的四项预期
+
+    输入：
+        python flagctl.py --db demo.sqlite diff dev qa
+    预期 stdout（退出码 0）：
+
+        {}
+
+    输入：
+        python flagctl.py --db demo.sqlite get dev new_ui
+    预期：stdout 为空；stderr 仅一行 VALUE_NOT_SET；退出码 2。
+
+    输入：
+        python flagctl.py --db demo.sqlite list dev
+    预期 stdout（退出码 0）：
+
+        {}
+
+  原因：dev 与 qa 现在都没有 new_ui 的记录，两侧均为未设置，
+  cmd_diff() 对“两侧相等（含都为 None）”的键不输出，故为 {}；
+  cmd_get() 查无此行报 VALUE_NOT_SET；cmd_list() 把“没有任何已保存
+  的值”表达为空对象 {}。
+
+  同类规则：同一键两侧都是相同布尔值（同为 true 或同为 false）时，
+  cmd_diff() 同样返回 {}；只有两侧不同（含一侧 false / 另一侧未设置）
+  才输出该键。环境与自身比较（diff dev dev）也返回 {}。
+
+
+3. 输出协议（由 main() 统一实现，本次不变）
+-------------------------------------------
+
+* 成功：退出码 0；stderr 为空；stdout 为单行结果加换行（"\n"）。
+  - diff / list 的结果是一行 JSON 对象；
+  - get 输出 true 或 false；unset 成功输出 unset；set 回显所设值。
+* 业务/存储错误：退出码 2（EXIT_ERROR）；stdout 为空；stderr 仅为
+  错误码加换行，如 VALUE_NOT_SET\n，不附带其他文本。
+* JSON 中空格的多少不影响含义；布尔与空值使用 JSON 的 true、false、
+  null，未设置不用空字符串表达。
+
+
+4. 边界与错误行为
+-----------------
+
+环境名（normalize_env() / validate_env()）：
+
+* 环境名只去除两端空白（strip），内部空白保留；区分大小写，
+  "Dev" 与 "dev" 是两个不同环境，存储与比较均按原文精确匹配。
+* diff 的任一环境名为空或去除空白后为空，先报 EMPTY_ENV，
+  在访问任何存储之前拒绝（main() 中先校验两侧环境名）。
+
+键名（validate_key() / KNOWN_KEYS）：
+
+* unset（以及 get / set）的键不在 KNOWN_KEYS 中时报 UNKNOWN_KEY。
+* main() 的判定顺序为：环境名 → 键名 → 布尔值（set 时），任一校验
+  失败前不触碰数据库；因此 unset 未知键报 UNKNOWN_KEY，而不会去执行
+  删除或落到存储类错误。
+
+存储状态分类（open_flag_store()，unset 与只读命令共用同一份规则）：
+
+* 父目录存在但数据库文件缺失：unset 报 VALUE_NOT_SET；diff 返回 {}。
+  不补建数据库文件。
+* 文件存在且是有效 SQLite 库但缺少 flags 表：unset 报 VALUE_NOT_SET；
+  diff 返回 {}。不补建 flags 表。
+* 父目录不存在：报 STORAGE_ERROR。
+* 目标文件不是有效 SQLite 数据库：报 STORAGE_ERROR。
+* flags 表存在但查询所需列缺失（如缺少 value 列）：报 STORAGE_ERROR。
+
+数据内容校验（cmd_list() 被 cmd_diff() 复用）：
+
+* diff 的任一目标环境中，已知键（KNOWN_KEYS 内的键）存有严格文本
+  "true"、"false" 以外的值（如 "1"、"TRUE"、空串等），报
+  STORAGE_ERROR，且不输出任何部分差异结果。
+* 未知键的行不参与比较，其值即使异常也不影响 diff；其他环境（既不是
+  左环境也不是右环境）的异常值同样不影响本次比较。
+
+行为性质再强调：
+
+* diff 全程只读，只做 SELECT，副作用为零；
+* unset 的语义是 DELETE 目标行，绝不通过把值改成 false 来表达“撤销”；
+  撤销之后该键回到“未设置”，与从未设置过的状态不可区分。
