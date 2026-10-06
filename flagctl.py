@@ -72,7 +72,7 @@ def connect(db_path):
 
 @contextlib.contextmanager
 def open_flag_store(db_path):
-    """get/unset 共用的既有存储访问入口，统一核对存储状态。
+    """get/unset/list 共用的存储访问入口，统一核对存储状态。
 
     不创建数据库文件、不补建 flags 表，存储状态的分类只在此维护一份：
 
@@ -154,39 +154,24 @@ def cmd_list(db_path, env):
     """列出目标环境已保存的已知键直接设置，返回 {键名: 布尔值}。
 
     纯只读查询：不创建数据库文件、目录或 flags 表，不改动任何记录。
-    存储状态分类与 open_flag_store 保持一致，只是“没有数据”的两种
-    状态（数据库文件缺失、有效库缺少 flags 表）对 list 意味着空结果
-    而非 VALUE_NOT_SET：
-
-    * 父目录不存在、连接失败、目标不是 SQLite 数据库、flags 表缺少
-      查询所需列 -> STORAGE_ERROR；
-    * 父目录存在但数据库文件缺失 -> 空 dict；
-    * 有效库缺少 flags 表 -> 空 dict；
-    * 其他 SQLite 错误 -> STORAGE_ERROR。
+    存储状态分类完全复用 open_flag_store 维护的唯一一份规则，只是把
+    “没有数据”的信号（VALUE_NOT_SET：数据库文件缺失或有效库缺少
+    flags 表）翻译为 list 语义下的空结果；其余 STORAGE_ERROR 原样
+    向上传递。
 
     未知键不出现在结果中；已知键若存有 true/false 之外的值，
     报 STORAGE_ERROR，不输出部分结果。
     """
-    if not os.path.exists(db_path):
-        parent = os.path.dirname(os.path.abspath(db_path))
-        if not os.path.isdir(parent):
-            raise FlagError("STORAGE_ERROR")
-        return {}
-    conn = connect(db_path)
     try:
-        try:
+        with open_flag_store(db_path) as conn:
             rows = conn.execute(
                 "SELECT key, value FROM flags WHERE env = ?", (env,)
             ).fetchall()
-        except sqlite3.OperationalError as exc:
-            # 已存在但缺少 flags 表的数据库视为没有任何已保存的值。
-            if "no such table" in str(exc):
-                return {}
-            raise FlagError("STORAGE_ERROR")
-        except sqlite3.Error:
-            raise FlagError("STORAGE_ERROR")
-    finally:
-        conn.close()
+    except FlagError as exc:
+        # 对 list 而言，“没有任何已保存的值”就是空结果而非错误。
+        if exc.code == "VALUE_NOT_SET":
+            return {}
+        raise
     result = {}
     for key, value in rows:
         if key not in KNOWN_KEYS:
