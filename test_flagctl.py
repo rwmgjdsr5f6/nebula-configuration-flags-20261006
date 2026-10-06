@@ -98,6 +98,9 @@ class FlagctlCliTestCase(unittest.TestCase):
     def diff_flags(self, db, left, right):
         return self.run_flagctl(db, "diff", left, right)
 
+    def envs_flags(self, db):
+        return self.run_flagctl(db, "envs")
+
     def read_table_names(self, db):
         """返回数据库中全部用户表名（升序）。"""
         conn = sqlite3.connect(db)
@@ -1386,6 +1389,271 @@ class TestDiff(FlagctlCliTestCase):
                 self.assertCommandError(proc, "STORAGE_ERROR")
 
                 self.assertEqual(self.read_flags_rows(db), before)
+
+
+class TestEnvs(FlagctlCliTestCase):
+    """envs 列出库中已有合法键直接设置的环境名。
+
+    输出协议：退出 0、stderr 为空、stdout 为单行 JSON 数组加换行；
+    环境含有至少一个已知键的直接设置（值为 true 或 false，false 也算
+    已设置）时才出现，同名去重并按名称 Unicode 码点字典序升序；名称
+    按库中原文输出，不去除空白、不转换大小写。未知键的记录不参与
+    判断，只含未知键的环境不出现，其异常值也不影响结果。查询全程
+    只读，不创建目录、文件或 flags 表，也不改动任何记录。
+    """
+
+    def assertEnvsOk(self, proc, expected):
+        """退出 0、stderr 为空、stdout 为单行 JSON 数组且解析等于 expected。"""
+        self.assertEqual(
+            proc.returncode, 0, "期望退出码 0，实际 stderr: %r" % proc.stderr
+        )
+        self.assertEqual(proc.stderr, "")
+        self.assertTrue(proc.stdout.endswith("\n"), "输出必须以换行结束")
+        body = proc.stdout[:-1]
+        self.assertNotIn("\n", body, "JSON 输出必须只有一行")
+        self.assertEqual(json.loads(body), expected)
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
+    def test_fixed_sample_lists_dev_and_qa_and_old_excluded(self):
+        # 固定验收样例：dev/new_ui=false、qa/new_ui=true，另有只含未知
+        # 键的 old 环境。envs 输出 ["dev", "qa"]；删除 dev 的 new_ui 后
+        # 输出 ["qa"]，qa 设置不变；每次查询前后表结构与全部记录一致。
+        db = self.db_path("envs_sample")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    ("old", "other_key", "true"),
+                )
+        finally:
+            conn.close()
+        before_rows = self.read_flags_rows(db)
+        before_cols = self.read_flags_columns(db)
+        self.assertEqual(
+            before_rows,
+            [
+                ("dev", "new_ui", "false"),
+                ("old", "other_key", "true"),
+                ("qa", "new_ui", "true"),
+            ],
+        )
+
+        self.assertEnvsOk(self.envs_flags(db), ["dev", "qa"])
+        # 查询不改表结构、不动任何记录（含 old 的未知键行）。
+        self.assertEqual(self.read_flags_columns(db), before_cols)
+        self.assertEqual(self.read_flags_rows(db), before_rows)
+
+        self.assertCommandOk(self.unset_flag(db, "dev", "new_ui"), "unset")
+        self.assertEnvsOk(self.envs_flags(db), ["qa"])
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("old", "other_key", "true"), ("qa", "new_ui", "true")],
+        )
+
+    def test_false_counts_as_set(self):
+        # 直接设置为 false 的环境照样出现。
+        db = self.db_path("envs_false")
+        self.seed_flags_table(db, [("dev", "new_ui", "false")])
+        self.assertEnvsOk(self.envs_flags(db), ["dev"])
+
+    def test_env_with_only_unknown_key_is_absent(self):
+        # 只有未知键（哪怕值为 true）的环境不出现；合法环境不受影响。
+        db = self.db_path("envs_only_unknown")
+        self.seed_flags_table(
+            db,
+            [
+                ("old", "other_key", "true"),
+                ("qa", "new_ui", "false"),
+                ("ancient", "mystery", "yes"),
+            ],
+        )
+        self.assertEnvsOk(self.envs_flags(db), ["qa"])
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [
+                ("ancient", "mystery", "yes"),
+                ("old", "other_key", "true"),
+                ("qa", "new_ui", "false"),
+            ],
+        )
+
+    def test_unknown_key_anomalous_value_does_not_error(self):
+        # 未知键上的异常值（yes、空串等）既不令环境出现，也不触发
+        # STORAGE_ERROR；含合法键的环境正常列出。
+        db = self.db_path("envs_unknown_bad")
+        self.seed_flags_table(
+            db,
+            [
+                ("old", "other_key", "yes"),
+                ("dev", "new_ui", "true"),
+                ("dev", "mystery", ""),
+            ],
+        )
+        self.assertEnvsOk(self.envs_flags(db), ["dev"])
+
+    def test_dedup_and_codepoint_ordering_and_verbatim_names(self):
+        # 同名环境去重；按名称 Unicode 码点字典序升序；区分大小写、
+        # 保留两端空白、中文原样输出。
+        db = self.db_path("envs_order")
+        self.seed_flags_table(
+            db,
+            [
+                ("qa", "new_ui", "true"),
+                ("dev", "new_ui", "false"),
+                ("dev", "other_key", "x"),
+                ("Dev", "new_ui", "false"),
+                (" dev", "new_ui", "true"),
+                ("中文环境", "new_ui", "true"),
+            ],
+        )
+        expected = sorted({"qa", "dev", "Dev", " dev", "中文环境"})
+        self.assertEnvsOk(self.envs_flags(db), expected)
+
+    def test_missing_db_returns_empty_array_without_creating_file(self):
+        # 父目录存在但数据库文件缺失：输出 []，文件仍不存在。
+        db = self.db_path("envs_missing")
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(db))
+
+        self.assertEnvsOk(self.envs_flags(db), [])
+
+        self.assertFalse(os.path.exists(db), "envs 不得创建数据库文件: %s" % db)
+
+    def test_valid_db_without_flags_table_returns_empty_array(self):
+        # 有效库缺少 flags 表：输出 []，不补建表，原有表与数据不变。
+        db = self.db_path("envs_no_flags_table")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+                )
+                conn.execute("INSERT INTO notes (text) VALUES ('sample note')")
+        finally:
+            conn.close()
+
+        self.assertEnvsOk(self.envs_flags(db), [])
+
+        self.assertEqual(self.read_table_names(db), ["notes"])
+        conn = sqlite3.connect(db)
+        try:
+            notes = conn.execute("SELECT id, text FROM notes").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(notes, [(1, "sample note")])
+
+    def test_empty_flags_table_returns_empty_array(self):
+        # flags 表存在但没有任何记录：输出 []。
+        db = self.db_path("envs_empty_table")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+        finally:
+            conn.close()
+
+        self.assertEnvsOk(self.envs_flags(db), [])
+        self.assertEqual(self.read_flags_columns(db), ["env", "key", "value"])
+
+    def test_missing_parent_directory_reports_storage_error(self):
+        # 父目录不存在：报 STORAGE_ERROR，不创建目录或文件。
+        missing_dir = os.path.join(self.tmpdir, "envs_no_such_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+
+        self.assertCommandError(self.envs_flags(db), "STORAGE_ERROR")
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_plain_text_file_reports_storage_error(self):
+        # 目标是普通文本文件而非 SQLite 库：报 STORAGE_ERROR，文件不变。
+        db = self.db_path("envs_plain_text")
+        content = b"this is not a sqlite database\njust fictional config\n"
+        with open(db, "wb") as fh:
+            fh.write(content)
+
+        self.assertCommandError(self.envs_flags(db), "STORAGE_ERROR")
+
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), content)
+
+    def test_missing_required_column_reports_storage_error(self):
+        # flags 表缺少 env、key、value 中任一列都报 STORAGE_ERROR，
+        # 表结构保持不变。
+        for label, schema in [
+            ("envs_no_env", "CREATE TABLE flags (key TEXT, value TEXT)"),
+            ("envs_no_key", "CREATE TABLE flags (env TEXT, value TEXT)"),
+            (
+                "envs_no_value",
+                "CREATE TABLE flags (env TEXT NOT NULL, key TEXT NOT NULL, "
+                "PRIMARY KEY (env, key))",
+            ),
+        ]:
+            with self.subTest(label=label):
+                db = self.db_path(label)
+                conn = sqlite3.connect(db)
+                try:
+                    with conn:
+                        conn.execute(schema)
+                finally:
+                    conn.close()
+                cols_before = self.read_flags_columns(db)
+
+                self.assertCommandError(self.envs_flags(db), "STORAGE_ERROR")
+
+                self.assertEqual(self.read_flags_columns(db), cols_before)
+
+    def test_invalid_known_key_value_reports_storage_error_without_partial_list(self):
+        # 库中任一已知键存有 true/false 之外的值：报 STORAGE_ERROR，
+        # stdout 为空、不输出部分名单；异常数据原样保留，不被修复。
+        db = self.db_path("envs_bad_value")
+        self.seed_flags_table(
+            db,
+            [
+                ("dev", "new_ui", "true"),
+                ("qa", "new_ui", "yes"),
+                ("old", "other_key", "false"),
+            ],
+        )
+        before = self.read_flags_rows(db)
+
+        self.assertCommandError(self.envs_flags(db), "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_rows(db), before)
+
+    def test_extra_arguments_are_rejected(self):
+        # envs 不接收环境名或键名：多余位置参数被拒绝（退出码非 0），
+        # 且拒绝参数不影响既有数据。
+        db = self.db_path("envs_extra_arg")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        proc = self.run_flagctl(db, "envs", "dev")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
 
 
 if __name__ == "__main__":

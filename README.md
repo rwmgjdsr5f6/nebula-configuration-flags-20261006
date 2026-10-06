@@ -47,6 +47,7 @@ stderr 均为空。
     python flagctl.py --db <库> unset <环境> <键>
     python flagctl.py --db <库> list <环境>
     python flagctl.py --db <库> diff <环境左> <环境右>
+    python flagctl.py --db <库> envs
 
 - **set**：保存或覆盖一个直接设置，成功时 stdout 回显所写入的
   `true` / `false`。
@@ -59,6 +60,14 @@ stderr 均为空。
   例如 `{"new_ui": {"left": false, "right": null}}`；一侧未设置用
   JSON `null` 表示。两侧都没有任何设置（或所有已知键两侧相同）时
   输出 `{}`。
+- **envs**：输出库中“已有直接设置的环境”组成的 JSON 数组，例如
+  `["dev", "qa"]`。环境含有至少一个合法键（`new_ui`）的直接设置时
+  才出现，直接设置为 `false` 也算已设置；只有未知键记录的环境不
+  出现，未知键的异常值也不影响结果。同名环境去重，按名称的 Unicode
+  码点字典序升序排列；名称按库中保存的文本原样输出（区分大小写、
+  保留空白，`Dev` 与 `dev` 分开列出）。库文件缺失、有效库缺 flags
+  表或没有合法键记录时输出 `[]`。envs 为只读命令，不补建目录、
+  文件或表。
 
 关于“直接设置为 false”与“未设置（null）”的区别，以及 unset、diff
 在这条流程上的完整行为，见 [direct-setting.txt](direct-setting.txt)。
@@ -88,14 +97,14 @@ stderr 均为空。
 - 同一 (env, key) 再次 set 会覆盖旧行（INSERT OR REPLACE）；
 - **set 首次写入时**会创建缺失的数据库文件并用
   `CREATE TABLE IF NOT EXISTS` 建表；
-- **get、unset、list、diff 不补建任何文件或表**：库文件不存在或缺
-  flags 表时按下文的错误/空结果规则处理。
+- **get、unset、list、diff、envs 不补建任何文件或表**：库文件不存在
+  或缺 flags 表时按下文的错误/空结果规则处理。
 
 ## 输出协议
 
 - **成功**：退出码 0；stderr 为空；stdout 为单行结果加换行。
   set/get 输出布尔文本，unset 输出 `unset`，list/diff 输出一行
-  JSON 对象。
+  JSON 对象，envs 输出一行 JSON 数组。
 - **失败**：退出码 2；stdout 为空；stderr 仅为错误码加换行，
   例如 `VALUE_NOT_SET`，不附带其他文本。
 
@@ -109,8 +118,9 @@ stderr 均为空。
   记录。父目录存在但数据库文件缺失、或文件是有效 SQLite 库但缺少
   flags 表时，也按此处理——查询不会顺手补建文件或表。
 - **STORAGE_ERROR**：父目录不存在；目标文件不是有效的 SQLite 数据库；
-  操作所需的表列缺失；以及 get、list、diff 在目标范围内读到已知键
-  保存了 `true` / `false` 之外的非法值（数据损坏）。
+  操作所需的表列缺失；以及 get、list、diff、envs 在目标范围内读到
+  已知键保存了 `true` / `false` 之外的非法值（数据损坏）。envs 的
+  目标范围是全库：库中任一合法键的值非法都报此错，不输出部分名单。
 
 校验顺序与副作用：
 
@@ -118,6 +128,10 @@ stderr 均为空。
   访问存储之前拒绝，因此输入校验失败不会创建数据库文件或表。
 - list 不把“没有数据”当作错误：数据库文件缺失、有效库缺少 flags 表
   或该环境没有任何记录，都输出 `{}`。
+- envs 同样不把“没有数据”当作错误：数据库文件缺失、有效库缺少
+  flags 表或全库没有任何合法键记录，都输出 `[]`。它全程只读，且
+  不接收环境名或键名；库中任一合法键存有非法值则报 STORAGE_ERROR，
+  不输出部分名单。
 - diff 的两侧各自按 list 的规则处理：两侧均无设置时输出 `{}`；任一
   目标环境中的已知键存在非法存储值则报 STORAGE_ERROR，不输出部分
   差异。其他环境以及未知键的记录不在目标范围内，其内容不影响结果。
