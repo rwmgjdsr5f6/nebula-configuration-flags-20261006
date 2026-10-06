@@ -20,7 +20,12 @@
 * get 的 EMPTY_ENV / UNKNOWN_KEY 拒绝顺序：键名不去空白、不转换大小写，
   校验失败不创建数据库文件或目录、不新增表或记录、不改变既有记录，
   父目录不存在时错误优先级不变（不降级为 STORAGE_ERROR）；
-* EMPTY_ENV / UNKNOWN_KEY / INVALID_BOOL 的拒绝顺序与输出协议。
+* EMPTY_ENV / UNKNOWN_KEY / INVALID_BOOL 的拒绝顺序与输出协议；
+* set 写入失败：父目录不存在、目标为普通文本文件、flags 表缺少
+  value 列三种状态均报 STORAGE_ERROR，且目录、文件内容、表结构与
+  既有记录保持原样；
+* 父目录不存在时 set 的输入校验先于存储访问：EMPTY_ENV /
+  UNKNOWN_KEY / INVALID_BOOL 各自唯一报错，不创建目录或文件。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
 每个用例使用独立的临时目录，结束后自动清理，只依赖 Python 3 标准库。
@@ -644,6 +649,114 @@ class TestUnsetStorageStates(FlagctlCliTestCase):
 
         with open(db, "r", encoding="utf-8") as fh:
             self.assertEqual(fh.read(), content)
+
+
+class TestSetStorageFailures(FlagctlCliTestCase):
+    """set 写入失败：三种存储状态均报 STORAGE_ERROR 且现场保持不变。
+
+    统一执行合法的 set dev new_ui true：
+
+    * 父目录不存在——报错后不创建目录或数据库文件；
+    * 目标是普通文本文件——报错后文件内容逐字节保持原样；
+    * 有效 SQLite 库但 flags 表只有 env、key 两列（预存 qa/new_ui）——
+      报错后表结构与既有记录保持不变，不新增 dev 记录。
+    """
+
+    def test_missing_parent_directory_reports_storage_error(self):
+        # 父目录不存在：报 STORAGE_ERROR，且不创建目录或文件。
+        missing_dir = os.path.join(self.tmpdir, "no_such_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+
+        proc = self.set_flag(db, "dev", "new_ui", "true")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_plain_text_file_reports_storage_error(self):
+        # 目标是已存在的普通文本文件而非 SQLite 库：报 STORAGE_ERROR，
+        # 原文件内容逐字节保持原样。
+        db = self.db_path("plain_text")
+        content = b"this is not a sqlite database\njust fictional config\n"
+        with open(db, "wb") as fh:
+            fh.write(content)
+
+        proc = self.set_flag(db, "dev", "new_ui", "true")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), content)
+
+    def test_flags_table_missing_value_column_reports_storage_error(self):
+        # 有效 SQLite 库的 flags 表只有 env、key 两列并预存 qa/new_ui：
+        # 报 STORAGE_ERROR，表结构与既有记录保持不变，不新增 dev 记录。
+        db = self.db_path("missing_value_column")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.execute(
+                    "INSERT INTO flags (env, key) VALUES ('qa', 'new_ui')"
+                )
+        finally:
+            conn.close()
+
+        proc = self.set_flag(db, "dev", "new_ui", "true")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        conn = sqlite3.connect(db)
+        try:
+            columns = [
+                row[1] for row in conn.execute("PRAGMA table_info(flags)")
+            ]
+            rows = conn.execute(
+                "SELECT env, key FROM flags ORDER BY env, key"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(columns, ["env", "key"], "表结构不得改变")
+        self.assertEqual(rows, [("qa", "new_ui")], "既有记录保持原样且不新增 dev")
+
+
+class TestSetValidationBeforeStorage(FlagctlCliTestCase):
+    """父目录不存在时，set 的输入校验先于存储访问。
+
+    每种非法输入都在父目录不存在的路径上验证：唯一报错为对应的校验
+    错误码（不降级为 STORAGE_ERROR），且不创建缺失的目录或数据库文件。
+    """
+
+    def assert_set_rejected_on_missing_parent(self, label, env, key, value, code):
+        """父目录不存在：校验错误优先，且不创建目录或文件。"""
+        missing_dir = os.path.join(self.tmpdir, label + "_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+        proc = self.set_flag(db, env, key, value)
+        self.assertCommandError(proc, code)
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_empty_env_takes_precedence_over_key_and_bool(self):
+        # 环境名仅为空格，键和值同时不合法：唯一错误为 EMPTY_ENV。
+        self.assert_set_rejected_on_missing_parent(
+            "empty_env_first", "   ", "bad_key", "TRUE", "EMPTY_ENV"
+        )
+
+    def test_unknown_key_takes_precedence_over_bool(self):
+        # 环境合法而键、值均不合法：唯一错误为 UNKNOWN_KEY。
+        self.assert_set_rejected_on_missing_parent(
+            "unknown_key_first", "dev", "other_key", "TRUE", "UNKNOWN_KEY"
+        )
+
+    def test_invalid_bool_rejected(self):
+        # 环境与键均合法、值不是小写布尔：唯一错误为 INVALID_BOOL。
+        self.assert_set_rejected_on_missing_parent(
+            "invalid_bool", "dev", "new_ui", "TRUE", "INVALID_BOOL"
+        )
 
 
 if __name__ == "__main__":
