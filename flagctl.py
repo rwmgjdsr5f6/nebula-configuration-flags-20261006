@@ -6,6 +6,7 @@
     python flagctl.py --db <数据库文件> get <环境名> <键名>
     python flagctl.py --db <数据库文件> unset <环境名> <键名>
     python flagctl.py --db <数据库文件> list <环境名>
+    python flagctl.py --db <数据库文件> diff <左环境名> <右环境名>
 
 仅使用 Python 3 标准库与 SQLite，不依赖网络或第三方包。
 """
@@ -185,6 +186,32 @@ def cmd_list(db_path, env):
     return result
 
 
+def cmd_diff(db_path, left_env, right_env):
+    """比较两个环境的已知键直接设置，只返回设置不同的键。
+
+    返回 {键名: {"left": 左侧值, "right": 右侧值}}，已设置为 JSON 布尔值，
+    未设置为 None（序列化为 null），false 与未设置严格区分；两侧都未设置
+    或布尔值相同的键不出现在结果中。只比较直接设置，不涉及默认值或继承。
+
+    纯只读：存储访问与数据校验完全复用 cmd_list 维护的唯一一份规则——
+    数据库文件缺失或有效库缺少 flags 表视为全部未设置，任一目标环境的已知
+    键存有 true/false 之外的值报 STORAGE_ERROR 且不输出部分差异；其他
+    环境及未知键的记录不参与比较。自身不新增任何存储规则，也不创建或
+    修改任何文件、目录、表或记录。
+    """
+    left = cmd_list(db_path, left_env)
+    right = cmd_list(db_path, right_env)
+    diff = {}
+    for key in KNOWN_KEYS:
+        lval = left.get(key)
+        rval = right.get(key)
+        # None 只与 None 相等，false 与未设置（None）自然区分开。
+        if lval == rval:
+            continue
+        diff[key] = {"left": lval, "right": rval}
+    return diff
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="flagctl.py", description="本地布尔功能开关命令行工具"
@@ -208,12 +235,28 @@ def build_parser():
     p_list = sub.add_parser("list", help="列出环境已保存的开关")
     p_list.add_argument("env")
 
+    p_diff = sub.add_parser("diff", help="比较两个环境的开关差异")
+    p_diff.add_argument("left_env")
+    p_diff.add_argument("right_env")
+
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "diff":
+            # diff 只接收两个环境名，按输入顺序作为左右两侧；两个环境名
+            # 都在访问存储之前校验，任一为空或全空白即报 EMPTY_ENV。
+            left_env = normalize_env(args.left_env)
+            right_env = normalize_env(args.right_env)
+            validate_env(left_env)
+            validate_env(right_env)
+            result = json.dumps(
+                cmd_diff(args.db, left_env, right_env), sort_keys=True
+            )
+            sys.stdout.write(result + "\n")
+            return EXIT_OK
         env = normalize_env(args.env)
         # 输入错误按环境名、键名、布尔值的顺序判断，
         # 且在任何校验失败前不得触碰数据库。
