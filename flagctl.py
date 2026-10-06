@@ -10,6 +10,7 @@
 """
 
 import argparse
+import contextlib
 import os
 import sqlite3
 import sys
@@ -67,6 +68,37 @@ def connect(db_path):
         raise FlagError("STORAGE_ERROR")
 
 
+@contextlib.contextmanager
+def open_flag_store(db_path):
+    """get/unset 共用的既有存储访问入口，统一核对存储状态。
+
+    不创建数据库文件、不补建 flags 表，存储状态的分类只在此维护一份：
+
+    * 父目录不存在或连接失败 -> STORAGE_ERROR；
+    * 父目录存在但数据库文件缺失 -> VALUE_NOT_SET；
+    * 有效库缺少 flags 表 -> VALUE_NOT_SET；
+    * 其他 SQLite 错误 -> STORAGE_ERROR。
+    """
+    if not os.path.exists(db_path):
+        parent = os.path.dirname(os.path.abspath(db_path))
+        if not os.path.isdir(parent):
+            raise FlagError("STORAGE_ERROR")
+        raise FlagError("VALUE_NOT_SET")
+    conn = connect(db_path)
+    try:
+        try:
+            yield conn
+        except sqlite3.OperationalError as exc:
+            # 已存在但缺少 flags 表的数据库视为没有任何已保存的值。
+            if "no such table" in str(exc):
+                raise FlagError("VALUE_NOT_SET")
+            raise FlagError("STORAGE_ERROR")
+        except sqlite3.Error:
+            raise FlagError("STORAGE_ERROR")
+    finally:
+        conn.close()
+
+
 def cmd_set(db_path, env, key, value):
     conn = connect(db_path)
     try:
@@ -84,58 +116,24 @@ def cmd_set(db_path, env, key, value):
 
 
 def cmd_get(db_path, env, key):
-    if not os.path.exists(db_path):
-        # 父目录不存在属于存储不可达；否则数据库文件不存在时不得创建文件，
-        # 视为没有任何已保存的值。
-        parent = os.path.dirname(os.path.abspath(db_path))
-        if not os.path.isdir(parent):
-            raise FlagError("STORAGE_ERROR")
-        raise FlagError("VALUE_NOT_SET")
-    conn = connect(db_path)
-    try:
+    with open_flag_store(db_path) as conn:
         row = conn.execute(
             "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
         ).fetchone()
-    except sqlite3.OperationalError as exc:
-        # 已存在但缺少 flags 表的数据库视为没有任何已保存的值。
-        if "no such table" in str(exc):
-            raise FlagError("VALUE_NOT_SET")
-        raise FlagError("STORAGE_ERROR")
-    except sqlite3.Error:
-        raise FlagError("STORAGE_ERROR")
-    finally:
-        conn.close()
     if row is None:
         raise FlagError("VALUE_NOT_SET")
     return row[0]
 
 
 def cmd_unset(db_path, env, key):
-    if not os.path.exists(db_path):
-        # 父目录不存在属于存储不可达；否则数据库文件不存在时不得创建文件，
-        # 视为没有任何已保存的值。
-        parent = os.path.dirname(os.path.abspath(db_path))
-        if not os.path.isdir(parent):
-            raise FlagError("STORAGE_ERROR")
-        raise FlagError("VALUE_NOT_SET")
-    conn = connect(db_path)
-    try:
-        # 不补建 flags 表：缺表与没有目标记录一样视为值未设置。
-        # 直接按主键删除，以 rowcount 是否为 0 区分记录是否存在，
-        # 无论原值是 true 还是 false 都删除该行。
-        try:
-            with conn:
-                cur = conn.execute(
-                    "DELETE FROM flags WHERE env = ? AND key = ?", (env, key)
-                )
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc):
-                raise FlagError("VALUE_NOT_SET")
-            raise FlagError("STORAGE_ERROR")
-        except sqlite3.Error:
-            raise FlagError("STORAGE_ERROR")
-    finally:
-        conn.close()
+    with open_flag_store(db_path) as conn:
+        # 不补建 flags 表：缺表与没有目标记录一样视为值未设置（由
+        # open_flag_store 统一分类）。直接按主键删除，以 rowcount 是否
+        # 为 0 区分记录是否存在，无论原值是 true 还是 false 都删除该行。
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM flags WHERE env = ? AND key = ?", (env, key)
+            )
     if cur.rowcount == 0:
         raise FlagError("VALUE_NOT_SET")
     return "unset"
