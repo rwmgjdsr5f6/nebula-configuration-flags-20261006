@@ -118,13 +118,24 @@ def cmd_set(db_path, env, key, value):
 
 
 def cmd_get(db_path, env, key):
+    """读取目标记录的布尔值，成功结果只能是严格的 true 或 false。
+
+    纯只读查询：不创建数据库文件、目录或 flags 表，不改动任何记录。
+    目标记录存在但内容不是严格的文本 true/false（如 yes、TRUE、1、
+    空字符串或带空白的 true）时按存储损坏处理，报 STORAGE_ERROR，
+    不做大小写转换、去空白或任何其他形式的宽松解释；只检查目标
+    记录本身，其他环境的异常值不影响合法目标值的读取。
+    """
     with open_flag_store(db_path) as conn:
         row = conn.execute(
             "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
         ).fetchone()
     if row is None:
         raise FlagError("VALUE_NOT_SET")
-    return row[0]
+    value = row[0]
+    if value != "true" and value != "false":
+        raise FlagError("STORAGE_ERROR")
+    return value
 
 
 def cmd_unset(db_path, env, key):
