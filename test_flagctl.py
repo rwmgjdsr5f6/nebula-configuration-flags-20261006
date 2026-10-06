@@ -36,6 +36,7 @@
     python -m unittest test_flagctl.TestPersistence.test_set_true_persists_across_processes
 """
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -76,6 +77,9 @@ class FlagctlCliTestCase(unittest.TestCase):
 
     def unset_flag(self, db, env, key):
         return self.run_flagctl(db, "unset", env, key)
+
+    def list_flags(self, db, env):
+        return self.run_flagctl(db, "list", env)
 
     def read_table_names(self, db):
         """返回数据库中全部用户表名（升序）。"""
@@ -767,6 +771,191 @@ class TestSetValidationBeforeStorage(FlagctlCliTestCase):
         # 环境与键合法、值非法：唯一错误为 INVALID_BOOL。
         self.assert_set_rejected_on_missing_parent(
             "set_invalid_bool", "dev", "new_ui", "TRUE", "INVALID_BOOL"
+        )
+
+
+class TestList(FlagctlCliTestCase):
+    """list 按环境列出已保存的已知键直接设置。
+
+    输出协议：退出 0、stderr 为空、stdout 为单行 JSON 对象加换行，
+    对象的键是开关名、值是 JSON 布尔值；只包含目标环境已保存且属于
+    已知键集合的记录，未设置的键不补 false，已保存的 false 不省略。
+    查询不创建数据库文件、目录或表，也不改动已有记录。
+    """
+
+    def assertListOk(self, proc, expected):
+        """退出 0、stderr 为空、stdout 为单行 JSON 且解析结果等于 expected。"""
+        self.assertEqual(
+            proc.returncode, 0, "期望退出码 0，实际 stderr: %r" % proc.stderr
+        )
+        self.assertEqual(proc.stderr, "")
+        self.assertTrue(proc.stdout.endswith("\n"), "输出必须以换行结束")
+        body = proc.stdout[:-1]
+        self.assertNotIn("\n", body, "JSON 输出必须只有一行")
+        self.assertEqual(json.loads(body), expected)
+
+    def test_list_returns_saved_values_per_env(self):
+        # dev/new_ui=false、qa/new_ui=true：各环境只看到自己的记录，
+        # 已保存的 false 出现在结果中且是 JSON 布尔值而非字符串。
+        db = self.db_path("list_envs")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+
+        self.assertListOk(self.list_flags(db, "dev"), {"new_ui": False})
+        self.assertListOk(self.list_flags(db, "qa"), {"new_ui": True})
+
+        # 查询不改库：既有记录保持原样。
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+
+    def test_list_env_surrounding_whitespace_matches_stripped(self):
+        # 带两端空白的 dev 与 dev 返回同一结果。
+        db = self.db_path("list_whitespace")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+
+        self.assertListOk(self.list_flags(db, "  dev  "), {"new_ui": True})
+
+    def test_list_env_without_rows_returns_empty_object(self):
+        # 只有 qa 记录的库查询 dev：输出 {}，不补 false，不新增记录。
+        db = self.db_path("list_only_qa")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+
+        self.assertListOk(self.list_flags(db, "dev"), {})
+
+        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "true")])
+
+    def test_list_missing_db_returns_empty_object_without_creating_file(self):
+        # 父目录存在但数据库文件缺失：输出 {}，文件仍不存在。
+        db = self.db_path("list_missing")
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(db))
+
+        self.assertListOk(self.list_flags(db, "dev"), {})
+
+        self.assertFalse(os.path.exists(db), "list 不得创建数据库文件: %s" % db)
+
+    def test_list_valid_db_without_flags_table_returns_empty_object(self):
+        # 有效库缺少 flags 表：输出 {}，不补建表，原有表与数据不变。
+        db = self.db_path("list_no_flags_table")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+                )
+                conn.execute("INSERT INTO notes (text) VALUES ('sample note')")
+        finally:
+            conn.close()
+
+        self.assertListOk(self.list_flags(db, "dev"), {})
+
+        self.assertEqual(self.read_table_names(db), ["notes"])
+
+    def test_list_excludes_unknown_keys(self):
+        # 库内未知键不出现在结果中，也不影响已知键的输出。
+        db = self.db_path("list_unknown_key")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    ("dev", "other_key", "true"),
+                )
+        finally:
+            conn.close()
+
+        self.assertListOk(self.list_flags(db, "dev"), {"new_ui": True})
+
+    def test_list_after_unset_no_longer_shows_record(self):
+        # 撤销后的记录不再出现在 list 中。
+        db = self.db_path("list_after_unset")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.unset_flag(db, "dev", "new_ui"), "unset")
+
+        self.assertListOk(self.list_flags(db, "dev"), {})
+
+    def test_list_empty_env_rejected_before_storage(self):
+        # 空串或全空白环境名报 EMPTY_ENV，即使数据库路径也不可用。
+        missing_dir = os.path.join(self.tmpdir, "list_no_such_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+
+        self.assertCommandError(self.list_flags(db, ""), "EMPTY_ENV")
+        self.assertCommandError(self.list_flags(db, "   "), "EMPTY_ENV")
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_list_missing_parent_directory_reports_storage_error(self):
+        # 父目录不存在：报 STORAGE_ERROR，不创建目录或文件。
+        missing_dir = os.path.join(self.tmpdir, "list_missing_parent")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+
+        self.assertCommandError(self.list_flags(db, "dev"), "STORAGE_ERROR")
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_list_plain_text_file_reports_storage_error(self):
+        # 目标是普通文本文件而非 SQLite 库：报 STORAGE_ERROR，文件不变。
+        db = self.db_path("list_plain_text")
+        content = "this is not a sqlite database\njust fictional config\n"
+        with open(db, "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+        self.assertCommandError(self.list_flags(db, "dev"), "STORAGE_ERROR")
+
+        with open(db, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), content)
+
+    def test_list_flags_table_without_value_column_reports_storage_error(self):
+        # flags 表缺少查询所需的 value 列：报 STORAGE_ERROR，表结构不变。
+        db = self.db_path("list_no_value_column")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.execute(
+                    "INSERT INTO flags (env, key) VALUES (?, ?)", ("qa", "new_ui")
+                )
+        finally:
+            conn.close()
+
+        self.assertCommandError(self.list_flags(db, "dev"), "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_columns(db), ["env", "key"])
+        self.assertEqual(self.read_flags_env_key_rows(db), [("qa", "new_ui")])
+
+    def test_list_invalid_stored_value_reports_storage_error(self):
+        # 已知键存有 true/false 之外的值：报 STORAGE_ERROR，不输出部分结果。
+        db = self.db_path("list_bad_value")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.execute(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    ("dev", "new_ui", "yes"),
+                )
+        finally:
+            conn.close()
+
+        self.assertCommandError(self.list_flags(db, "dev"), "STORAGE_ERROR")
+
+        self.assertEqual(
+            self.read_flags_rows(db), [("dev", "new_ui", "yes")]
         )
 
 

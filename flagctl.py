@@ -5,12 +5,14 @@
     python flagctl.py --db <数据库文件> set <环境名> <键名> <true|false>
     python flagctl.py --db <数据库文件> get <环境名> <键名>
     python flagctl.py --db <数据库文件> unset <环境名> <键名>
+    python flagctl.py --db <数据库文件> list <环境名>
 
 仅使用 Python 3 标准库与 SQLite，不依赖网络或第三方包。
 """
 
 import argparse
 import contextlib
+import json
 import os
 import sqlite3
 import sys
@@ -139,6 +141,56 @@ def cmd_unset(db_path, env, key):
     return "unset"
 
 
+def cmd_list(db_path, env):
+    """列出目标环境已保存的已知键直接设置，返回 {键名: 布尔值}。
+
+    纯只读查询：不创建数据库文件、目录或 flags 表，不改动任何记录。
+    存储状态分类与 open_flag_store 保持一致，只是“没有数据”的两种
+    状态（数据库文件缺失、有效库缺少 flags 表）对 list 意味着空结果
+    而非 VALUE_NOT_SET：
+
+    * 父目录不存在、连接失败、目标不是 SQLite 数据库、flags 表缺少
+      查询所需列 -> STORAGE_ERROR；
+    * 父目录存在但数据库文件缺失 -> 空 dict；
+    * 有效库缺少 flags 表 -> 空 dict；
+    * 其他 SQLite 错误 -> STORAGE_ERROR。
+
+    未知键不出现在结果中；已知键若存有 true/false 之外的值，
+    报 STORAGE_ERROR，不输出部分结果。
+    """
+    if not os.path.exists(db_path):
+        parent = os.path.dirname(os.path.abspath(db_path))
+        if not os.path.isdir(parent):
+            raise FlagError("STORAGE_ERROR")
+        return {}
+    conn = connect(db_path)
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT key, value FROM flags WHERE env = ?", (env,)
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            # 已存在但缺少 flags 表的数据库视为没有任何已保存的值。
+            if "no such table" in str(exc):
+                return {}
+            raise FlagError("STORAGE_ERROR")
+        except sqlite3.Error:
+            raise FlagError("STORAGE_ERROR")
+    finally:
+        conn.close()
+    result = {}
+    for key, value in rows:
+        if key not in KNOWN_KEYS:
+            continue
+        if value == "true":
+            result[key] = True
+        elif value == "false":
+            result[key] = False
+        else:
+            raise FlagError("STORAGE_ERROR")
+    return result
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="flagctl.py", description="本地布尔功能开关命令行工具"
@@ -159,6 +211,9 @@ def build_parser():
     p_unset.add_argument("env")
     p_unset.add_argument("key")
 
+    p_list = sub.add_parser("list", help="列出环境已保存的开关")
+    p_list.add_argument("env")
+
     return parser
 
 
@@ -169,14 +224,18 @@ def main(argv=None):
         # 输入错误按环境名、键名、布尔值的顺序判断，
         # 且在任何校验失败前不得触碰数据库。
         validate_env(env)
-        validate_key(args.key)
-        if args.command == "set":
-            value = parse_bool(args.value)
-            result = cmd_set(args.db, env, args.key, value)
-        elif args.command == "unset":
-            result = cmd_unset(args.db, env, args.key)
+        if args.command == "list":
+            # list 只接收环境名，输出单行 JSON 对象，值为 JSON 布尔值。
+            result = json.dumps(cmd_list(args.db, env), sort_keys=True)
         else:
-            result = cmd_get(args.db, env, args.key)
+            validate_key(args.key)
+            if args.command == "set":
+                value = parse_bool(args.value)
+                result = cmd_set(args.db, env, args.key, value)
+            elif args.command == "unset":
+                result = cmd_unset(args.db, env, args.key)
+            else:
+                result = cmd_get(args.db, env, args.key)
     except FlagError as exc:
         sys.stderr.write(exc.code + "\n")
         return EXIT_ERROR
