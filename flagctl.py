@@ -83,26 +83,39 @@ def cmd_set(db_path, env, key, value):
     return value
 
 
-def cmd_get(db_path, env, key):
+def open_existing(db_path):
+    """为 get/unset 打开已存在的数据库连接，统一存储状态分类。
+
+    父目录不存在属于存储不可达；父目录存在但数据库文件缺失时不得创建文件，
+    视为没有任何已保存的值。
+    """
     if not os.path.exists(db_path):
-        # 父目录不存在属于存储不可达；否则数据库文件不存在时不得创建文件，
-        # 视为没有任何已保存的值。
         parent = os.path.dirname(os.path.abspath(db_path))
         if not os.path.isdir(parent):
             raise FlagError("STORAGE_ERROR")
         raise FlagError("VALUE_NOT_SET")
-    conn = connect(db_path)
+    return connect(db_path)
+
+
+def classify_access_error(exc):
+    """把 get/unset 访问 flags 表时的 SQLite 异常归为业务错误码。
+
+    已存在但缺少 flags 表的数据库视为没有任何已保存的值；
+    其余 SQLite 错误一律视为存储错误。
+    """
+    if isinstance(exc, sqlite3.OperationalError) and "no such table" in str(exc):
+        return FlagError("VALUE_NOT_SET")
+    return FlagError("STORAGE_ERROR")
+
+
+def cmd_get(db_path, env, key):
+    conn = open_existing(db_path)
     try:
         row = conn.execute(
             "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
         ).fetchone()
-    except sqlite3.OperationalError as exc:
-        # 已存在但缺少 flags 表的数据库视为没有任何已保存的值。
-        if "no such table" in str(exc):
-            raise FlagError("VALUE_NOT_SET")
-        raise FlagError("STORAGE_ERROR")
-    except sqlite3.Error:
-        raise FlagError("STORAGE_ERROR")
+    except sqlite3.Error as exc:
+        raise classify_access_error(exc)
     finally:
         conn.close()
     if row is None:
@@ -111,14 +124,7 @@ def cmd_get(db_path, env, key):
 
 
 def cmd_unset(db_path, env, key):
-    if not os.path.exists(db_path):
-        # 父目录不存在属于存储不可达；否则数据库文件不存在时不得创建文件，
-        # 视为没有任何已保存的值。
-        parent = os.path.dirname(os.path.abspath(db_path))
-        if not os.path.isdir(parent):
-            raise FlagError("STORAGE_ERROR")
-        raise FlagError("VALUE_NOT_SET")
-    conn = connect(db_path)
+    conn = open_existing(db_path)
     try:
         # 不补建 flags 表：缺表与没有目标记录一样视为值未设置。
         # 直接按主键删除，以 rowcount 是否为 0 区分记录是否存在，
@@ -128,12 +134,8 @@ def cmd_unset(db_path, env, key):
                 cur = conn.execute(
                     "DELETE FROM flags WHERE env = ? AND key = ?", (env, key)
                 )
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc):
-                raise FlagError("VALUE_NOT_SET")
-            raise FlagError("STORAGE_ERROR")
-        except sqlite3.Error:
-            raise FlagError("STORAGE_ERROR")
+        except sqlite3.Error as exc:
+            raise classify_access_error(exc)
     finally:
         conn.close()
     if cur.rowcount == 0:
