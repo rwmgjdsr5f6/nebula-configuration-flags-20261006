@@ -6,6 +6,7 @@
     python flagctl.py --db <数据库文件> get <环境名> <键名>
     python flagctl.py --db <数据库文件> unset <环境名> <键名>
     python flagctl.py --db <数据库文件> list <环境名>
+    python flagctl.py --db <数据库文件> diff <环境名左> <环境名右>
 
 仅使用 Python 3 标准库与 SQLite，不依赖网络或第三方包。
 """
@@ -185,6 +186,30 @@ def cmd_list(db_path, env):
     return result
 
 
+def cmd_diff(db_path, left_env, right_env):
+    """按输入顺序比较两个环境已知键的直接设置，返回差异对象。
+
+    纯只读：比较逻辑直接复用 cmd_list 的存储分类与数据校验——文件
+    缺失、有效库缺少 flags 表或环境无记录都视为该环境没有任何直接
+    设置（空映射）；连接或查询失败、任一目标环境的已知键存有严格
+    文本 true/false 之外的值都报 STORAGE_ERROR，不输出部分差异。
+    其他环境及未知键的记录不参与比较，其异常值也不影响结果。
+
+    输出只保留两侧不同的键：已设置是 JSON 布尔值，未设置是 None
+    （序列化为 null），false 与未设置明确区分；两边都未设置或布尔
+    值相同的键不输出。
+    """
+    left = cmd_list(db_path, left_env)
+    right = cmd_list(db_path, right_env)
+    result = {}
+    for key in sorted(KNOWN_KEYS):
+        left_value = left.get(key)
+        right_value = right.get(key)
+        if left_value != right_value:
+            result[key] = {"left": left_value, "right": right_value}
+    return result
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="flagctl.py", description="本地布尔功能开关命令行工具"
@@ -208,28 +233,41 @@ def build_parser():
     p_list = sub.add_parser("list", help="列出环境已保存的开关")
     p_list.add_argument("env")
 
+    p_diff = sub.add_parser("diff", help="只读比较两个环境的直接设置")
+    p_diff.add_argument("env_left")
+    p_diff.add_argument("env_right")
+
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
-        env = normalize_env(args.env)
-        # 输入错误按环境名、键名、布尔值的顺序判断，
-        # 且在任何校验失败前不得触碰数据库。
-        validate_env(env)
-        if args.command == "list":
-            # list 只接收环境名，输出单行 JSON 对象，值为 JSON 布尔值。
-            result = json.dumps(cmd_list(args.db, env), sort_keys=True)
+        if args.command == "diff":
+            # diff 接收两个环境名，按输入顺序区分左右；比较前先校验
+            # 两个环境名，任一为空或全空白都在访问存储前拒绝。
+            left = normalize_env(args.env_left)
+            right = normalize_env(args.env_right)
+            validate_env(left)
+            validate_env(right)
+            result = json.dumps(cmd_diff(args.db, left, right), sort_keys=True)
         else:
-            validate_key(args.key)
-            if args.command == "set":
-                value = parse_bool(args.value)
-                result = cmd_set(args.db, env, args.key, value)
-            elif args.command == "unset":
-                result = cmd_unset(args.db, env, args.key)
+            env = normalize_env(args.env)
+            # 输入错误按环境名、键名、布尔值的顺序判断，
+            # 且在任何校验失败前不得触碰数据库。
+            validate_env(env)
+            if args.command == "list":
+                # list 只接收环境名，输出单行 JSON 对象，值为 JSON 布尔值。
+                result = json.dumps(cmd_list(args.db, env), sort_keys=True)
             else:
-                result = cmd_get(args.db, env, args.key)
+                validate_key(args.key)
+                if args.command == "set":
+                    value = parse_bool(args.value)
+                    result = cmd_set(args.db, env, args.key, value)
+                elif args.command == "unset":
+                    result = cmd_unset(args.db, env, args.key)
+                else:
+                    result = cmd_get(args.db, env, args.key)
     except FlagError as exc:
         sys.stderr.write(exc.code + "\n")
         return EXIT_ERROR
