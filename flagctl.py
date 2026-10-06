@@ -70,22 +70,34 @@ def connect(db_path):
         raise FlagError("STORAGE_ERROR")
 
 
+class _NoStoredFlags(Exception):
+    """内部信号：存储里没有任何已保存的开关值。
+
+    仅由 open_flag_store 在两种“没有数据”的状态下抛出：父目录存在
+    但数据库文件缺失、有效库中没有 flags 表。get/unset 将其翻译为
+    VALUE_NOT_SET，list 将其翻译为空结果 {}；三条命令的存储状态
+    判定因此只在 open_flag_store 维护一份。
+    """
+
+
 @contextlib.contextmanager
 def open_flag_store(db_path):
-    """get/unset 共用的既有存储访问入口，统一核对存储状态。
+    """get/unset/list 共用的既有存储访问入口，统一判定存储状态。
 
-    不创建数据库文件、不补建 flags 表，存储状态的分类只在此维护一份：
+    不创建数据库文件、目录，不补建 flags 表。存储状态的分类只在此
+    维护一份：
 
-    * 父目录不存在或连接失败 -> STORAGE_ERROR；
-    * 父目录存在但数据库文件缺失 -> VALUE_NOT_SET；
-    * 有效库缺少 flags 表 -> VALUE_NOT_SET；
-    * 其他 SQLite 错误 -> STORAGE_ERROR。
+    * 父目录不存在或连接失败 -> FlagError(STORAGE_ERROR)；
+    * 父目录存在但数据库文件缺失 -> _NoStoredFlags；
+    * 有效库缺少 flags 表 -> _NoStoredFlags（查询报错时识别）；
+    * 目标不是 SQLite 库、操作所需列缺失或其他 SQLite 错误
+      -> FlagError(STORAGE_ERROR)。
     """
     if not os.path.exists(db_path):
         parent = os.path.dirname(os.path.abspath(db_path))
         if not os.path.isdir(parent):
             raise FlagError("STORAGE_ERROR")
-        raise FlagError("VALUE_NOT_SET")
+        raise _NoStoredFlags()
     conn = connect(db_path)
     try:
         try:
@@ -93,12 +105,22 @@ def open_flag_store(db_path):
         except sqlite3.OperationalError as exc:
             # 已存在但缺少 flags 表的数据库视为没有任何已保存的值。
             if "no such table" in str(exc):
-                raise FlagError("VALUE_NOT_SET")
+                raise _NoStoredFlags()
             raise FlagError("STORAGE_ERROR")
         except sqlite3.Error:
             raise FlagError("STORAGE_ERROR")
     finally:
         conn.close()
+
+
+@contextlib.contextmanager
+def open_required_flag_store(db_path):
+    """get/unset 的薄包装：_NoStoredFlags 等价于 VALUE_NOT_SET。"""
+    try:
+        with open_flag_store(db_path) as conn:
+            yield conn
+    except _NoStoredFlags:
+        raise FlagError("VALUE_NOT_SET")
 
 
 def cmd_set(db_path, env, key, value):
@@ -125,7 +147,7 @@ def cmd_get(db_path, env, key):
     不做大小写转换、不去除空白、不输出原值。只检查目标记录，其他
     环境的异常值不在本次读取范围内。
     """
-    with open_flag_store(db_path) as conn:
+    with open_required_flag_store(db_path) as conn:
         row = conn.execute(
             "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
         ).fetchone()
@@ -137,8 +159,8 @@ def cmd_get(db_path, env, key):
 
 
 def cmd_unset(db_path, env, key):
-    with open_flag_store(db_path) as conn:
-        # 不补建 flags 表：缺表与没有目标记录一样视为值未设置（由
+    with open_required_flag_store(db_path) as conn:
+        # 不补建 flags 表：缺表与数据库文件缺失一样视为值未设置（由
         # open_flag_store 统一分类）。直接按主键删除，以 rowcount 是否
         # 为 0 区分记录是否存在，无论原值是 true 还是 false 都删除该行。
         with conn:
@@ -154,39 +176,20 @@ def cmd_list(db_path, env):
     """列出目标环境已保存的已知键直接设置，返回 {键名: 布尔值}。
 
     纯只读查询：不创建数据库文件、目录或 flags 表，不改动任何记录。
-    存储状态分类与 open_flag_store 保持一致，只是“没有数据”的两种
-    状态（数据库文件缺失、有效库缺少 flags 表）对 list 意味着空结果
-    而非 VALUE_NOT_SET：
-
-    * 父目录不存在、连接失败、目标不是 SQLite 数据库、flags 表缺少
-      查询所需列 -> STORAGE_ERROR；
-    * 父目录存在但数据库文件缺失 -> 空 dict；
-    * 有效库缺少 flags 表 -> 空 dict；
-    * 其他 SQLite 错误 -> STORAGE_ERROR。
+    存储状态判定复用 open_flag_store：“没有数据”的两种状态（数据库
+    文件缺失、有效库缺少 flags 表）对 list 意味着空结果 {}，其余
+    存储问题与 get/unset 一样报 STORAGE_ERROR。
 
     未知键不出现在结果中；已知键若存有 true/false 之外的值，
     报 STORAGE_ERROR，不输出部分结果。
     """
-    if not os.path.exists(db_path):
-        parent = os.path.dirname(os.path.abspath(db_path))
-        if not os.path.isdir(parent):
-            raise FlagError("STORAGE_ERROR")
-        return {}
-    conn = connect(db_path)
     try:
-        try:
+        with open_flag_store(db_path) as conn:
             rows = conn.execute(
                 "SELECT key, value FROM flags WHERE env = ?", (env,)
             ).fetchall()
-        except sqlite3.OperationalError as exc:
-            # 已存在但缺少 flags 表的数据库视为没有任何已保存的值。
-            if "no such table" in str(exc):
-                return {}
-            raise FlagError("STORAGE_ERROR")
-        except sqlite3.Error:
-            raise FlagError("STORAGE_ERROR")
-    finally:
-        conn.close()
+    except _NoStoredFlags:
+        return {}
     result = {}
     for key, value in rows:
         if key not in KNOWN_KEYS:
