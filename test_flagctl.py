@@ -31,7 +31,16 @@
   前后目录、文件字节、表结构与既有记录全部保持不变；
 * set 的输入校验先于存储访问：父目录不存在时 EMPTY_ENV /
   UNKNOWN_KEY / INVALID_BOOL 依旧按原优先级报告，不降级为
-  STORAGE_ERROR，且不创建目录或文件。
+  STORAGE_ERROR，且不创建目录或文件；
+* diff 只读比较两个环境的直接设置：固定样例 dev/new_ui=false、
+  qa/new_ui=true 输出 {"new_ui": {"left": false, "right": true}}，
+  交换环境顺序左右值互换；相同值、两侧未设置、自比均输出 {}；
+  一侧未设置对应值为 null，已保存的 false 不等于未设置；环境名
+  两端空白被去除而大小写敏感；未知键与其他环境的异常值不参与
+  比较；空或全空白环境名报 EMPTY_ENV（优先于存储访问）；文件
+  缺失或有效库缺 flags 表输出 {} 且不创建文件或表；父目录不存在、
+  目标为普通文本文件、flags 表缺 value 列、任一目标环境存非法值
+  均报 STORAGE_ERROR，不输出部分差异，现场保持不变。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
 每个用例使用独立的临时目录，结束后自动清理，只依赖 Python 3 标准库。
@@ -86,6 +95,26 @@ class FlagctlCliTestCase(unittest.TestCase):
     def list_flags(self, db, env):
         return self.run_flagctl(db, "list", env)
 
+    def diff_flags(self, db, left_env, right_env):
+        return self.run_flagctl(db, "diff", left_env, right_env)
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
     def read_table_names(self, db):
         """返回数据库中全部用户表名（升序）。"""
         conn = sqlite3.connect(db)
@@ -139,6 +168,17 @@ class FlagctlCliTestCase(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(proc.stdout, "")
         self.assertEqual(proc.stderr, code + "\n")
+
+    def assertJsonOk(self, proc, expected):
+        """退出 0、stderr 为空、stdout 为单行 JSON 且解析结果等于 expected。"""
+        self.assertEqual(
+            proc.returncode, 0, "期望退出码 0，实际 stderr: %r" % proc.stderr
+        )
+        self.assertEqual(proc.stderr, "")
+        self.assertTrue(proc.stdout.endswith("\n"), "输出必须以换行结束")
+        body = proc.stdout[:-1]
+        self.assertNotIn("\n", body, "JSON 输出必须只有一行")
+        self.assertEqual(json.loads(body), expected)
 
     def assert_rejected_on_fresh_path(self, label, env, key, value, code):
         """全新路径上拒绝写入：报错且不留下数据库文件。"""
@@ -468,23 +508,6 @@ class TestGetStoredValueValidation(FlagctlCliTestCase):
     ``STORAGE_ERROR\\n``），不得通过大小写转换、数字转换或去除空白
     接受，也不得输出原值；读取前后记录逐行保持不变。
     """
-
-    def seed_flags_table(self, db, rows):
-        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
-        conn = sqlite3.connect(db)
-        try:
-            with conn:
-                conn.execute(
-                    "CREATE TABLE flags ("
-                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
-                    "PRIMARY KEY (env, key))"
-                )
-                conn.executemany(
-                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
-                    rows,
-                )
-        finally:
-            conn.close()
 
     def test_fixed_samples_yes_errors_false_ok_and_rows_unchanged(self):
         # 固定样例：dev/new_ui=yes、qa/new_ui=false。读 dev 报
@@ -933,14 +956,7 @@ class TestList(FlagctlCliTestCase):
 
     def assertListOk(self, proc, expected):
         """退出 0、stderr 为空、stdout 为单行 JSON 且解析结果等于 expected。"""
-        self.assertEqual(
-            proc.returncode, 0, "期望退出码 0，实际 stderr: %r" % proc.stderr
-        )
-        self.assertEqual(proc.stderr, "")
-        self.assertTrue(proc.stdout.endswith("\n"), "输出必须以换行结束")
-        body = proc.stdout[:-1]
-        self.assertNotIn("\n", body, "JSON 输出必须只有一行")
-        self.assertEqual(json.loads(body), expected)
+        self.assertJsonOk(proc, expected)
 
     def test_list_returns_saved_values_per_env(self):
         # dev/new_ui=false、qa/new_ui=true：各环境只看到自己的记录，
@@ -1105,6 +1121,282 @@ class TestList(FlagctlCliTestCase):
         self.assertEqual(
             self.read_flags_rows(db), [("dev", "new_ui", "yes")]
         )
+
+
+class TestDiff(FlagctlCliTestCase):
+    """diff 只读比较两个环境已知键的直接设置。
+
+    输出协议：退出 0、stderr 为空、stdout 为单行 JSON 对象加换行；
+    只输出两侧不同的已知键，已设置一侧是 JSON 布尔值，未设置一侧是
+    null。查询不创建数据库文件、目录或表，也不改动已有记录。
+    """
+
+    def test_diff_fixed_sample_dev_false_qa_true(self):
+        # 主要固定样例：dev/new_ui=false、qa/new_ui=true。
+        # diff dev qa 输出 {"new_ui": {"left": false, "right": true}}，
+        # 交换环境顺序后左右值互换；两次查询后记录保持原样。
+        db = self.db_path("diff_sample")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+
+        self.assertJsonOk(
+            self.diff_flags(db, "dev", "qa"),
+            {"new_ui": {"left": False, "right": True}},
+        )
+        self.assertJsonOk(
+            self.diff_flags(db, "qa", "dev"),
+            {"new_ui": {"left": True, "right": False}},
+        )
+
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+
+    def test_diff_same_values_returns_empty_object(self):
+        # 两侧布尔值相同（true 与 false 各验证一次）时不输出该键。
+        db = self.db_path("diff_same_true")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        self.assertJsonOk(self.diff_flags(db, "dev", "qa"), {})
+
+        db = self.db_path("diff_same_false")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        self.assertJsonOk(self.diff_flags(db, "dev", "qa"), {})
+
+    def test_diff_both_unset_returns_empty_object(self):
+        # 两侧都没有任何记录：输出 {}，不补 false。
+        db = self.db_path("diff_both_unset")
+        self.assertCommandOk(self.set_flag(db, "staging", "new_ui", "true"), "true")
+
+        self.assertJsonOk(self.diff_flags(db, "dev", "qa"), {})
+
+        self.assertEqual(
+            self.read_flags_rows(db), [("staging", "new_ui", "true")]
+        )
+
+    def test_diff_self_comparison_returns_empty_object(self):
+        # 同一环境自比永远无差异，无论该环境是否已设置。
+        db = self.db_path("diff_self")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+
+        self.assertJsonOk(self.diff_flags(db, "dev", "dev"), {})
+        self.assertJsonOk(self.diff_flags(db, "qa", "qa"), {})
+
+    def test_diff_one_side_unset_reports_null(self):
+        # 一侧未设置时对应值为 null；已保存的 false 是已设置而非未设置。
+        db = self.db_path("diff_one_unset")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+
+        self.assertJsonOk(
+            self.diff_flags(db, "dev", "qa"),
+            {"new_ui": {"left": False, "right": None}},
+        )
+        self.assertJsonOk(
+            self.diff_flags(db, "qa", "dev"),
+            {"new_ui": {"left": None, "right": False}},
+        )
+
+    def test_diff_env_surrounding_whitespace_stripped(self):
+        # 环境名两端空白被去除：" dev " 与 dev 指向同一环境。
+        db = self.db_path("diff_whitespace")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+
+        self.assertJsonOk(
+            self.diff_flags(db, "  dev  ", "\tqa\t"),
+            {"new_ui": {"left": True, "right": False}},
+        )
+
+    def test_diff_env_case_sensitive(self):
+        # 环境名大小写敏感：Dev 与 dev 是两个不同环境。
+        db = self.db_path("diff_case")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+
+        self.assertJsonOk(
+            self.diff_flags(db, "Dev", "dev"),
+            {"new_ui": {"left": None, "right": True}},
+        )
+
+    def test_diff_ignores_unknown_keys_and_other_envs(self):
+        # 未知键（含异常值）与其他环境的异常记录不参与比较，也不影响
+        # 合法目标环境的结果；查询后所有记录（含异常值）原样保留。
+        db = self.db_path("diff_out_of_scope")
+        self.seed_flags_table(
+            db,
+            [
+                ("dev", "new_ui", "true"),
+                ("dev", "other_key", "yes"),
+                ("staging", "new_ui", "yes"),
+            ],
+        )
+        before = self.read_flags_rows(db)
+
+        self.assertJsonOk(
+            self.diff_flags(db, "dev", "qa"),
+            {"new_ui": {"left": True, "right": None}},
+        )
+
+        self.assertEqual(self.read_flags_rows(db), before)
+
+
+class TestDiffValidation(FlagctlCliTestCase):
+    """diff 的环境名校验：拒绝发生在触碰数据库之前。
+
+    左右任一环境为空串或全空白都报 EMPTY_ENV，即使数据库父目录不
+    存在也先报告该错误，且不创建目录或文件。
+    """
+
+    def assert_diff_rejected_on_missing_parent(self, label, left, right):
+        """父目录不存在：EMPTY_ENV 优先于 STORAGE_ERROR，不创建目录或文件。"""
+        missing_dir = os.path.join(self.tmpdir, label + "_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+        with self.subTest(left=left, right=right):
+            proc = self.diff_flags(db, left, right)
+            self.assertCommandError(proc, "EMPTY_ENV")
+            self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+            self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_empty_left_env_rejected(self):
+        self.assert_diff_rejected_on_missing_parent("diff_empty_left", "", "qa")
+
+    def test_empty_right_env_rejected(self):
+        self.assert_diff_rejected_on_missing_parent("diff_empty_right", "dev", "")
+
+    def test_whitespace_only_env_rejected(self):
+        self.assert_diff_rejected_on_missing_parent("diff_blank_left", "   ", "qa")
+        self.assert_diff_rejected_on_missing_parent("diff_blank_right", "dev", " \t ")
+
+    def test_both_envs_empty_rejected(self):
+        self.assert_diff_rejected_on_missing_parent("diff_both_empty", "", "  ")
+
+
+class TestDiffStorageStates(FlagctlCliTestCase):
+    """diff 在各数据库状态下的退出码、输出协议与现场保持。
+
+    父目录存在但数据库文件缺失、有效库缺少 flags 表时查询成功并输出
+    {}，不创建文件或补建表；父目录不存在、目标为普通文本文件、flags
+    表缺 value 列、任一目标环境的 new_ui 存有非法值时报
+    STORAGE_ERROR，不输出部分差异，现场保持不变。
+    """
+
+    def test_missing_db_returns_empty_object_without_creating_file(self):
+        # 父目录存在但数据库文件缺失：输出 {}，文件仍不存在。
+        db = self.db_path("diff_missing")
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(db))
+
+        self.assertJsonOk(self.diff_flags(db, "dev", "qa"), {})
+
+        self.assertFalse(os.path.exists(db), "diff 不得创建数据库文件: %s" % db)
+
+    def test_valid_db_without_flags_table_returns_empty_object(self):
+        # 有效库缺少 flags 表：输出 {}，不补建表，原有表与数据不变。
+        db = self.db_path("diff_no_flags_table")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+                )
+                conn.execute("INSERT INTO notes (text) VALUES ('sample note')")
+        finally:
+            conn.close()
+        self.assertEqual(self.read_table_names(db), ["notes"])
+
+        self.assertJsonOk(self.diff_flags(db, "dev", "qa"), {})
+
+        self.assertEqual(self.read_table_names(db), ["notes"])
+        conn = sqlite3.connect(db)
+        try:
+            notes = conn.execute("SELECT id, text FROM notes").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(notes, [(1, "sample note")])
+
+    def test_missing_parent_directory_reports_storage_error(self):
+        # 父目录不存在：报 STORAGE_ERROR，且不创建目录或文件。
+        missing_dir = os.path.join(self.tmpdir, "diff_no_such_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+
+        proc = self.diff_flags(db, "dev", "qa")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_plain_text_file_reports_storage_error(self):
+        # 目标是普通文本文件而非 SQLite 库：报 STORAGE_ERROR，
+        # 文件逐字节保持原样。
+        db = self.db_path("diff_plain_text")
+        content = b"this is not a sqlite database\njust fictional config\n"
+        with open(db, "wb") as fh:
+            fh.write(content)
+
+        proc = self.diff_flags(db, "dev", "qa")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), content)
+
+    def test_flags_table_without_value_column_reports_storage_error(self):
+        # flags 表缺少查询所需的 value 列：报 STORAGE_ERROR，表结构与
+        # 既有记录保持不变。
+        db = self.db_path("diff_no_value_column")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.execute(
+                    "INSERT INTO flags (env, key) VALUES (?, ?)", ("qa", "new_ui")
+                )
+        finally:
+            conn.close()
+        self.assertEqual(self.read_flags_columns(db), ["env", "key"])
+        self.assertEqual(self.read_flags_env_key_rows(db), [("qa", "new_ui")])
+
+        proc = self.diff_flags(db, "dev", "qa")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_columns(db), ["env", "key"])
+        self.assertEqual(self.read_flags_env_key_rows(db), [("qa", "new_ui")])
+
+    def test_invalid_value_in_left_env_reports_storage_error(self):
+        # 左侧目标环境的 new_ui 存有 yes：报 STORAGE_ERROR，不输出
+        # 部分差异，异常记录不被修复或删除。
+        db = self.db_path("diff_bad_left")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "yes"), ("qa", "new_ui", "true")],
+        )
+        before = self.read_flags_rows(db)
+
+        proc = self.diff_flags(db, "dev", "qa")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_rows(db), before)
+
+    def test_invalid_value_in_right_env_reports_storage_error(self):
+        # 右侧目标环境的 new_ui 存有 yes：同样报 STORAGE_ERROR，
+        # 左侧的合法值也不构成部分输出。
+        db = self.db_path("diff_bad_right")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "yes")],
+        )
+        before = self.read_flags_rows(db)
+
+        proc = self.diff_flags(db, "dev", "qa")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_rows(db), before)
 
 
 if __name__ == "__main__":
