@@ -9,6 +9,9 @@
 * get 在四种数据库状态下的行为：有效库缺 flags 表、flags 表无对应
   环境记录（VALUE_NOT_SET），父目录不存在、目标为普通文本文件
   （STORAGE_ERROR），且读取前后相关数据与文件状态保持不变；
+* get 的 EMPTY_ENV / UNKNOWN_KEY 拒绝顺序：键名不去空白、不折大小写，
+  校验失败不创建数据库、不改变既有记录，且在父目录不存在的路径上
+  仍优先于 STORAGE_ERROR；
 * unset 撤销已保存记录（原值 true 与 false 各一条固定样例）的输出
   协议：记录物理消失而非改成 false、环境名两端空白命中同一记录、
   重复撤销报 VALUE_NOT_SET 且不影响其他环境；
@@ -327,6 +330,88 @@ class TestGetStorageStates(FlagctlCliTestCase):
 
         with open(db, "r", encoding="utf-8") as fh:
             self.assertEqual(fh.read(), content)
+
+
+class TestGetValidation(FlagctlCliTestCase):
+    """get 的输入校验：拒绝发生在触碰数据库之前。
+
+    每种非法输入都在三种现场各验证一次：父目录存在但数据库文件未创建
+    （不留下文件）、已保存 dev/new_ui=false 与 qa/new_ui=true 的库
+    （既有记录与值全部保持原样）、父目录不存在的路径（仍报校验错误而
+    非 STORAGE_ERROR，且不创建目录或文件）。断言失败时 subTest 会指出
+    具体的 env/key 输入。
+    """
+
+    def assert_get_rejected_on_fresh_path(self, label, env, key, code):
+        """父目录存在但数据库文件未创建：报错且不留下数据库文件。"""
+        db = self.db_path(label)
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(db))
+        with self.subTest(env=env, key=key, db=db):
+            proc = self.get_flag(db, env, key)
+            self.assertCommandError(proc, code)
+            self.assertFalse(
+                os.path.exists(db), "校验失败不得创建数据库文件: %s" % db
+            )
+
+    def assert_get_rejected_keeps_saved_rows(self, label, env, key, code):
+        """已有 dev/qa 记录的库上拒绝读取：报错且既有记录全部保持原样。"""
+        db = self.db_path(label)
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        with self.subTest(env=env, key=key, db=db):
+            proc = self.get_flag(db, env, key)
+            self.assertCommandError(proc, code)
+            # 不新增表或记录，既有行与值保持不变。
+            self.assertEqual(self.read_table_names(db), ["flags"])
+            self.assertEqual(
+                self.read_flags_rows(db),
+                [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+            )
+            self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+            self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+    def assert_get_rejected_on_missing_parent(self, label, env, key, code):
+        """父目录不存在：仍按校验错误拒绝，不得报 STORAGE_ERROR 或创建目录。"""
+        missing_dir = os.path.join(self.tmpdir, label + "_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+        with self.subTest(env=env, key=key, db=db):
+            proc = self.get_flag(db, env, key)
+            self.assertCommandError(proc, code)
+            self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+            self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def assert_get_rejected(self, label, env, key, code):
+        """同一非法输入在三种现场下得到同一错误码且无副作用。"""
+        self.assert_get_rejected_on_fresh_path(label + "_fresh", env, key, code)
+        self.assert_get_rejected_keeps_saved_rows(label + "_kept", env, key, code)
+        self.assert_get_rejected_on_missing_parent(
+            label + "_no_parent", env, key, code
+        )
+
+    def test_empty_env_rejected(self):
+        self.assert_get_rejected("get_empty_env", "", "new_ui", "EMPTY_ENV")
+
+    def test_whitespace_only_env_rejected(self):
+        self.assert_get_rejected("get_blank_env", "   ", "new_ui", "EMPTY_ENV")
+
+    def test_unknown_key_rejected(self):
+        self.assert_get_rejected("get_unknown_key", "dev", "other_key", "UNKNOWN_KEY")
+
+    def test_key_with_surrounding_whitespace_rejected(self):
+        # 键名不做去空白处理：带两端空格的 new_ui 不等于已知键。
+        self.assert_get_rejected(
+            "get_padded_key", "dev", "  new_ui  ", "UNKNOWN_KEY"
+        )
+
+    def test_key_case_mismatch_rejected(self):
+        # 键名不做大小写转换：New_UI 不等于 new_ui。
+        self.assert_get_rejected("get_case_key", "dev", "New_UI", "UNKNOWN_KEY")
+
+    def test_empty_env_takes_precedence_over_unknown_key(self):
+        # 环境名与键同时不合法：唯一结果是 EMPTY_ENV。
+        self.assert_get_rejected("get_order", "", "bad_key", "EMPTY_ENV")
 
 
 class TestUnsetPersistence(FlagctlCliTestCase):
