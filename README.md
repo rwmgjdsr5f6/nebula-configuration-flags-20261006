@@ -47,6 +47,7 @@ stderr 均为空。
     python flagctl.py --db <库> unset <环境> <键>
     python flagctl.py --db <库> list <环境>
     python flagctl.py --db <库> diff <环境左> <环境右>
+    python flagctl.py --db <库> envs
 
 - **set**：保存或覆盖一个直接设置，成功时 stdout 回显所写入的
   `true` / `false`。
@@ -59,6 +60,12 @@ stderr 均为空。
   例如 `{"new_ui": {"left": false, "right": null}}`；一侧未设置用
   JSON `null` 表示。两侧都没有任何设置（或所有已知键两侧相同）时
   输出 `{}`。
+- **envs**：不接收环境名或键名，输出库中至少有一个已知键直接设置
+  的环境名组成的 JSON 数组，例如 `["dev", "qa"]`；值为 `false` 的
+  直接设置也算已设置。环境名按库中保存的原文输出（区分大小写、
+  保留内部空白），去重后按 Unicode 码点字典序升序排列；只有未知键
+  的环境不出现。库文件缺失、有效库缺 `flags` 表或没有合法键记录时
+  输出 `[]`。
 
 关于“直接设置为 false”与“未设置（null）”的区别，以及 unset、diff
 在这条流程上的完整行为，见 [direct-setting.txt](direct-setting.txt)。
@@ -88,14 +95,14 @@ stderr 均为空。
 - 同一 (env, key) 再次 set 会覆盖旧行（INSERT OR REPLACE）；
 - **set 首次写入时**会创建缺失的数据库文件并用
   `CREATE TABLE IF NOT EXISTS` 建表；
-- **get、unset、list、diff 不补建任何文件或表**：库文件不存在或缺
+- **get、unset、list、diff、envs 不补建任何文件或表**：库文件不存在或缺
   flags 表时按下文的错误/空结果规则处理。
 
 ## 输出协议
 
 - **成功**：退出码 0；stderr 为空；stdout 为单行结果加换行。
   set/get 输出布尔文本，unset 输出 `unset`，list/diff 输出一行
-  JSON 对象。
+  JSON 对象，envs 输出一行 JSON 数组。
 - **失败**：退出码 2；stdout 为空；stderr 仅为错误码加换行，
   例如 `VALUE_NOT_SET`，不附带其他文本。
 
@@ -109,8 +116,9 @@ stderr 均为空。
   记录。父目录存在但数据库文件缺失、或文件是有效 SQLite 库但缺少
   flags 表时，也按此处理——查询不会顺手补建文件或表。
 - **STORAGE_ERROR**：父目录不存在；目标文件不是有效的 SQLite 数据库；
-  操作所需的表列缺失；以及 get、list、diff 在目标范围内读到已知键
-  保存了 `true` / `false` 之外的非法值（数据损坏）。
+  操作所需的表列缺失；以及 get、list、diff、envs 在目标范围内读到已知键
+  保存了 `true` / `false` 之外的非法值（数据损坏）。envs 的目标范围是
+  全库所有已知键行：任一已知键值非法即报此错，未知键的异常值不影响结果。
 
 校验顺序与副作用：
 
@@ -118,9 +126,15 @@ stderr 均为空。
   访问存储之前拒绝，因此输入校验失败不会创建数据库文件或表。
 - list 不把“没有数据”当作错误：数据库文件缺失、有效库缺少 flags 表
   或该环境没有任何记录，都输出 `{}`。
+- envs 与 list 一样不把“没有数据”当作错误：数据库文件缺失、有效库
+  缺少 flags 表或库中没有合法键记录，都输出 `[]`；envs 不接收任何
+  环境名或键名参数。
 - diff 的两侧各自按 list 的规则处理：两侧均无设置时输出 `{}`；任一
   目标环境中的已知键存在非法存储值则报 STORAGE_ERROR，不输出部分
   差异。其他环境以及未知键的记录不在目标范围内，其内容不影响结果。
+- envs 的目标范围是全库：任一环境的已知键存在非法存储值即报
+  STORAGE_ERROR，不输出部分名单；未知键的记录不参与判断，其异常
+  值也不影响结果。
 
 ## 当前不提供的能力
 

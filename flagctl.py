@@ -7,6 +7,7 @@
     python flagctl.py --db <数据库文件> unset <环境名> <键名>
     python flagctl.py --db <数据库文件> list <环境名>
     python flagctl.py --db <数据库文件> diff <环境名左> <环境名右>
+    python flagctl.py --db <数据库文件> envs
 
 仅使用 Python 3 标准库与 SQLite，不依赖网络或第三方包。
 """
@@ -210,6 +211,39 @@ def cmd_diff(db_path, left_env, right_env):
     return result
 
 
+def cmd_envs(db_path):
+    """列出库中至少有一个已知键直接设置的环境名，返回去重后的列表。
+
+    纯只读查询：不创建数据库文件、目录或 flags 表，不改动任何记录。
+    存储状态分类与 cmd_list 复用同一份 open_flag_store 规则，把
+    “没有数据”的信号（VALUE_NOT_SET：数据库文件缺失或有效库缺少
+    flags 表）翻译为空列表；其余 STORAGE_ERROR 原样向上传递。
+
+    环境只要有任一行的键属于 KNOWN_KEYS 即入选，值为 false 同样算
+    已设置；未知键的行不参与判断，只有未知键的环境不出现，其异常
+    值也不影响结果。环境名按库中保存的文本原样输出（不转换大小写、
+    不去除空白），同名去重，按 Unicode 码点字典序升序排列。任一已
+    知键行存有严格文本 true/false 之外的值，报 STORAGE_ERROR，
+    不输出部分名单。
+    """
+    try:
+        with open_flag_store(db_path) as conn:
+            rows = conn.execute("SELECT env, key, value FROM flags").fetchall()
+    except FlagError as exc:
+        # 对 envs 而言，“没有任何已保存的值”就是空列表而非错误。
+        if exc.code == "VALUE_NOT_SET":
+            return []
+        raise
+    envs = set()
+    for env, key, value in rows:
+        if key not in KNOWN_KEYS:
+            continue
+        if value != "true" and value != "false":
+            raise FlagError("STORAGE_ERROR")
+        envs.add(env)
+    return sorted(envs)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="flagctl.py", description="本地布尔功能开关命令行工具"
@@ -237,13 +271,18 @@ def build_parser():
     p_diff.add_argument("env_left")
     p_diff.add_argument("env_right")
 
+    sub.add_parser("envs", help="列出库中有已知键直接设置的环境")
+
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "diff":
+        if args.command == "envs":
+            # envs 不接收环境名或键名：输出单行 JSON 数组。
+            result = json.dumps(cmd_envs(args.db), ensure_ascii=False)
+        elif args.command == "diff":
             # diff 接收两个环境名，按输入顺序区分左右；比较前先校验
             # 两个环境名，任一为空或全空白都在访问存储前拒绝。
             left = normalize_env(args.env_left)
