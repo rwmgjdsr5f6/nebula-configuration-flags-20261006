@@ -71,6 +71,19 @@
   返回 {} 且不创建文件或表；父目录不存在、目标为普通文本文件、
   flags 表缺 value 列或任一目标环境存有非法值时报 STORAGE_ERROR，
   不输出部分差异，且调用前后目录、文件字节、表结构与记录保持不变。
+* diff --exit-code 在 stdout/stderr 协议完全不变的前提下用退出码额外
+  表达完整比较结果：固定样例 demo.sqlite（dev/new_ui=false、
+  qa/new_ui=true）上不加参数退出 0、追加参数退出 1，两次 stdout 完全
+  一致，均为单行 {"new_ui": {"left": false, "right": true}} 加换行，
+  stderr 均为空；两个环境都保存 false 的独立样例带参数退出 0、输出
+  {}；只有 dev 保存 false 而 qa 未设置时带参数退出 1，left 为 false、
+  right 为 null，不把 false 与未设置混为一谈；任一环境名仅含空白时
+  只报 EMPTY_ENV，目标环境的 new_ui 保存非法文本 yes（另一侧为合法
+  设置）时只报 STORAGE_ERROR，两类失败即使带参数也退出 2、stdout
+  为空、stderr 严格为错误码加换行，不返回退出码 1 或部分差异；父
+  目录存在而数据库文件缺失时带参数输出 {}、退出 0 且库文件继续不
+  存在；各用例使用独立临时样例，比较前后库文件字节与记录保持一致，
+  非法值不被修正。
 * import 从 JSON 文件导入一个环境的直接设置：固定样例
   dev/new_ui=true、qa/new_ui=true 导入 {"new_ui": false} 后 dev
   变为 false、qa 保持 true；空对象 {} 不访问数据库；非空导入在
@@ -229,6 +242,10 @@ class FlagctlCliTestCase(unittest.TestCase):
 
     def diff_flags(self, db, left, right):
         return self.run_flagctl(db, "diff", left, right)
+
+    def diff_flags_exit_code(self, db, left, right):
+        """在全新进程中执行 diff <左> <右> --exit-code。"""
+        return self.run_flagctl(db, "diff", left, right, "--exit-code")
 
     def envs_flags(self, db):
         return self.run_flagctl(db, "envs")
@@ -2414,6 +2431,181 @@ class TestDiff(FlagctlCliTestCase):
                 self.assertCommandError(proc, "STORAGE_ERROR")
 
                 self.assertEqual(self.read_flags_rows(db), before)
+
+
+class TestDiffExitCode(FlagctlCliTestCase):
+    """diff --exit-code 的命令行回归：退出码表达比较结果，输出协议不变。
+
+    附加 --exit-code 时 stdout/stderr 与不带参数完全相同：成功时 stdout
+    为单行 JSON 对象加换行、stderr 为空；差异对象为空退出 0、非空退出
+    1；比较失败仍退出 2（stdout 为空、stderr 仅为错误码加换行）。
+    比较全程只读，不创建目录、库文件或表，也不改动、修复任何记录；
+    已保存的 false 是有效设置，与未设置（null）明确区分。每个用例使用
+    独立的临时样例。
+    """
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
+    def read_db_bytes(self, db):
+        with open(db, "rb") as fh:
+            return fh.read()
+
+    def assert_diff_success(self, proc, expected_text, returncode):
+        """stdout 严格为 expected_text（含末尾换行）、stderr 为空、
+        退出码等于 returncode；并核对 JSON 为单行、解析结果与文本一致。"""
+        self.assertEqual(
+            proc.returncode,
+            returncode,
+            "期望退出码 %r，实际 stderr: %r" % (returncode, proc.stderr),
+        )
+        self.assertEqual(proc.stderr, "")
+        self.assertEqual(proc.stdout, expected_text)
+        body = proc.stdout[:-1]
+        self.assertNotIn("\n", body, "JSON 输出必须只有一行")
+        self.assertEqual(json.loads(body), json.loads(expected_text[:-1]))
+
+    def test_fixed_sample_plain_exit_0_exit_code_exit_1_identical_output(self):
+        # 固定样例：dev/new_ui=false、qa/new_ui=true。
+        # 不带 --exit-code 退出 0；带该参数退出 1；两次 stdout 逐字节
+        # 完全一致，均为单行 {"new_ui": {"left": false, "right": true}}
+        # 加换行（沿用当前默认 JSON 空格），stderr 均为空；两次只读比较
+        # 后库文件字节与记录保持原样。
+        db = self.db_path("demo")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        bytes_before = self.read_db_bytes(db)
+        rows_before = self.read_flags_rows(db)
+        expected = '{"new_ui": {"left": false, "right": true}}\n'
+
+        plain = self.diff_flags(db, "dev", "qa")
+        coded = self.diff_flags_exit_code(db, "dev", "qa")
+
+        self.assert_diff_success(plain, expected, 0)
+        self.assert_diff_success(coded, expected, 1)
+        # 两次 stdout 必须逐字节一致，换行也核对。
+        self.assertEqual(plain.stdout, coded.stdout)
+        self.assertEqual(plain.stderr, coded.stderr)
+        self.assertEqual(plain.stderr, "")
+        self.assertEqual(self.read_db_bytes(db), bytes_before)
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+
+    def test_both_false_exit_code_exit_0_empty_object(self):
+        # 两个环境都保存 false 的独立样例：带参数退出 0，stdout 严格为
+        # {} 加换行，stderr 为空；记录保持两条 false。
+        db = self.db_path("both_false")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        bytes_before = self.read_db_bytes(db)
+
+        proc = self.diff_flags_exit_code(db, "dev", "qa")
+
+        self.assert_diff_success(proc, "{}\n", 0)
+        self.assertEqual(self.read_db_bytes(db), bytes_before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "false")],
+        )
+
+    def test_false_vs_unset_exit_code_exit_1_with_null_right(self):
+        # 只有 dev 保存 false 而 qa 未设置：带参数仍退出 1（false 不与
+        # 未设置混同），输出 left 为 false、right 为 null；比较后只有
+        # dev 一条记录，qa 仍未设置。
+        db = self.db_path("false_vs_unset")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        bytes_before = self.read_db_bytes(db)
+
+        proc = self.diff_flags_exit_code(db, "dev", "qa")
+
+        self.assert_diff_success(
+            proc, '{"new_ui": {"left": false, "right": null}}\n', 1
+        )
+        parsed = json.loads(proc.stdout)
+        self.assertIs(parsed["new_ui"]["left"], False)
+        self.assertIsNone(parsed["new_ui"]["right"])
+        self.assertEqual(self.read_db_bytes(db), bytes_before)
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "false")])
+
+    def test_whitespace_only_env_reports_empty_env_exit_2(self):
+        # 任一环境名仅含空白：带参数比较也只报 EMPTY_ENV，退出 2、
+        # stdout 为空、stderr 严格为 EMPTY_ENV 加换行，不返回退出码 1；
+        # 库文件字节与记录（含另一侧的合法设置）保持不变。
+        db = self.db_path("empty_env")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+        bytes_before = self.read_db_bytes(db)
+        rows_before = self.read_flags_rows(db)
+
+        for left, right in [
+            ("   ", "qa"),
+            ("dev", " \t "),
+            ("\t\t", "  "),
+        ]:
+            with self.subTest(left=left, right=right):
+                proc = self.diff_flags_exit_code(db, left, right)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, "")
+                self.assertEqual(proc.stderr, "EMPTY_ENV\n")
+
+        self.assertEqual(self.read_db_bytes(db), bytes_before)
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+
+    def test_invalid_stored_value_reports_storage_error_exit_2(self):
+        # 目标环境 qa 的 new_ui 保存非法文本 yes、dev 一侧为合法 false：
+        # 带参数比较只报 STORAGE_ERROR，退出 2、stdout 为空、stderr 严格
+        # 为 STORAGE_ERROR 加换行——不能返回退出码 1 或部分差异；非法值
+        # 不被修正，两条记录原样保留。
+        db = self.db_path("bad_value")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "yes")],
+        )
+        bytes_before = self.read_db_bytes(db)
+        rows_before = self.read_flags_rows(db)
+
+        proc = self.diff_flags_exit_code(db, "dev", "qa")
+
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(proc.stderr, "STORAGE_ERROR\n")
+        self.assertEqual(self.read_db_bytes(db), bytes_before)
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "yes")],
+        )
+
+    def test_missing_db_exit_code_outputs_empty_object_without_creating_file(self):
+        # 父目录存在而数据库文件缺失：带参数比较输出 {}、退出 0、stderr
+        # 为空；检查结果不得创建库文件，比较前后文件都不存在。
+        db = self.db_path("missing")
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(db))
+
+        proc = self.diff_flags_exit_code(db, "dev", "qa")
+
+        self.assert_diff_success(proc, "{}\n", 0)
+        self.assertFalse(os.path.exists(db), "diff 不得创建数据库文件: %s" % db)
 
 
 class TestEnvs(FlagctlCliTestCase):
