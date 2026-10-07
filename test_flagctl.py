@@ -61,6 +61,19 @@
   解除失败条件后以同一环境同一文件立即重试，退出 0、stderr 为空、
   stdout 为单行 {"new_ui": false} 加换行，dev 变为 false、qa 仍为
   true，完整记录仅这两条。
+* import --dry-run 只读预览导入变化：固定主样例 demo.sqlite
+  （dev/new_ui=true、qa/new_ui=false）预览 UTF-8 文件 candidate.json
+  （{"new_ui":false}）输出单行 {"new_ui":{"before":true,"after":false}}
+  加换行，退出 0、stderr 为空，随后 get dev new_ui 仍输出 true；原值
+  已是 false 时输出 {}，目标记录不存在时 before 为 null、after 为
+  false（未设置不等于 false）；父目录存在而库文件缺失、有效库缺
+  flags 表时非空文件预览以 null 表示原值，不补建文件或表；合法空
+  对象在父目录不存在时仍成功输出 {}，不创建目录或访问存储，同路径
+  非空文件报 STORAGE_ERROR；目标记录存储文本为 yes 时报
+  STORAGE_ERROR，原值保留、不输出部分结果，其他环境或未知键的异常
+  值不影响合法目标的预览；每次预览前后输入文件字节、库文件字节、
+  完整记录与表结构均保持一致，qa 记录保留，所有失败退出 2、stdout
+  为空、stderr 仅为错误码加换行。
 * export 把单环境已保存的直接设置导出为 JSON 文件：固定样例
   dev/new_ui=false、qa/new_ui=true 导出 dev 得到 {"new_ui": false}，
   stdout 与文件同为单行 JSON 加换行（无 BOM），再导入另一库的
@@ -145,6 +158,9 @@ class FlagctlCliTestCase(unittest.TestCase):
 
     def import_flags(self, db, env, file_path):
         return self.run_flagctl(db, "import", env, file_path)
+
+    def import_flags_dry_run(self, db, env, file_path):
+        return self.run_flagctl(db, "import", env, file_path, "--dry-run")
 
     def export_flags(self, db, env, file_path):
         return self.run_flagctl(db, "export", env, file_path)
@@ -2466,6 +2482,256 @@ sys.exit(flagctl.main())
         self.assertEqual(self.read_flags_columns(db), cols_before)
         with open(settings, "rb") as fh:
             self.assertEqual(fh.read(), settings_bytes, "重试后导入文件内容必须保持原样")
+
+
+class TestImportDryRunPreview(FlagctlCliTestCase):
+    """import --dry-run 只读预览的回归。
+
+    固定主样例：demo.sqlite 仅含 dev/new_ui=true 与 qa/new_ui=false
+    两行；candidate.json 是 UTF-8 文件，内容为 {"new_ui":false}。
+    预览成功时退出 0、stderr 为空、stdout 为单行紧凑 JSON 加换行，
+    只含变化键的 {"before": 原值或 null, "after": 导入值}；失败时
+    退出 2、stdout 为空、stderr 仅为错误码加换行。预览全程只读：
+    不创建目录、库文件或表，不改动任何记录，输入文件字节保持不变。
+    """
+
+    CANDIDATE_JSON = b'{"new_ui":false}'
+    EMPTY_JSON = b"{}"
+
+    def make_demo_db(self):
+        """固定主样例库 demo.sqlite：dev/new_ui=true，qa/new_ui=false。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        return db
+
+    def write_candidate(self, content=None, name="candidate.json"):
+        """在临时目录按固定文件名写入 UTF-8 字节，返回完整路径。"""
+        if content is None:
+            content = self.CANDIDATE_JSON
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(content)
+        return path
+
+    def read_bytes(self, path):
+        """读取文件全部原始字节。"""
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def assert_demo_db_untouched(self, db, db_bytes):
+        """库文件字节、完整记录与表结构均与调用前快照一致。"""
+        self.assertEqual(
+            self.read_bytes(db), db_bytes, "预览后库文件字节必须保持不变"
+        )
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "false")],
+            "预览后完整记录必须保持不变（含 qa 的记录）",
+        )
+        self.assertEqual(
+            self.read_flags_columns(db),
+            ["env", "key", "value"],
+            "预览后表结构必须保持不变",
+        )
+
+    def test_fixed_sample_preview_then_get_still_true(self):
+        # 固定验收流程：预览 dev 导入 {"new_ui":false} 输出单行
+        # {"new_ui":{"before":true,"after":false}} 加换行，退出 0、
+        # stderr 为空；随后 get dev new_ui 仍输出 true。
+        db = self.make_demo_db()
+        path = self.write_candidate()
+        db_bytes = self.read_bytes(db)
+
+        proc = self.import_flags_dry_run(db, "dev", path)
+        self.assertCommandOk(proc, '{"new_ui":{"before":true,"after":false}}')
+
+        # 预览后：输入文件字节、库文件字节、完整记录与表结构均不变。
+        self.assertEqual(self.read_bytes(path), self.CANDIDATE_JSON)
+        self.assert_demo_db_untouched(db, db_bytes)
+
+        # 预览没有写入：dev 仍为 true，qa 仍为 false，现场依旧不变。
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+        self.assert_demo_db_untouched(db, db_bytes)
+        self.assertEqual(self.read_bytes(path), self.CANDIDATE_JSON)
+
+    def test_preview_same_value_returns_empty_object(self):
+        # 原值已经是 false：预览输出 {}，既有值保持 false。
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        path = self.write_candidate()
+        db_bytes = self.read_bytes(db)
+        rows_before = self.read_flags_rows(db)
+
+        proc = self.import_flags_dry_run(db, "dev", path)
+        self.assertCommandOk(proc, "{}")
+
+        self.assertEqual(self.read_bytes(path), self.CANDIDATE_JSON)
+        self.assertEqual(self.read_bytes(db), db_bytes, "库文件字节必须保持不变")
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+
+    def test_preview_unset_target_reports_before_null(self):
+        # 目标记录不存在：before 为 null、after 为 false，未设置不等于
+        # false；预览不补建记录，随后 get 仍报 VALUE_NOT_SET。
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "false")])
+        path = self.write_candidate()
+        db_bytes = self.read_bytes(db)
+
+        proc = self.import_flags_dry_run(db, "dev", path)
+        self.assertCommandOk(proc, '{"new_ui":{"before":null,"after":false}}')
+
+        self.assertEqual(self.read_bytes(path), self.CANDIDATE_JSON)
+        self.assertEqual(self.read_bytes(db), db_bytes, "库文件字节必须保持不变")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("qa", "new_ui", "false")],
+            "预览不得补建 dev 记录，qa 记录保留",
+        )
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+
+    def test_preview_missing_db_file_reports_before_null_without_creating(self):
+        # 父目录存在而库文件缺失：非空文件预览以 null 表示原值，退出 0，
+        # 不补建数据库文件。
+        db = self.db_path("preview_missing_db")
+        self.assertFalse(os.path.exists(db))
+        path = self.write_candidate()
+
+        proc = self.import_flags_dry_run(db, "dev", path)
+        self.assertCommandOk(proc, '{"new_ui":{"before":null,"after":false}}')
+
+        self.assertFalse(os.path.exists(db), "预览不得创建数据库文件: %s" % db)
+        self.assertEqual(self.read_bytes(path), self.CANDIDATE_JSON)
+
+    def test_preview_valid_db_without_flags_table_reports_before_null(self):
+        # 有效库没有 flags 表：非空文件预览以 null 表示原值，退出 0，
+        # 不补建 flags 表，原有表与数据保持不变。
+        db = self.db_path("preview_no_flags_table")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+                )
+                conn.execute("INSERT INTO notes (text) VALUES ('sample note')")
+        finally:
+            conn.close()
+        self.assertEqual(self.read_table_names(db), ["notes"])
+        path = self.write_candidate()
+
+        proc = self.import_flags_dry_run(db, "dev", path)
+        self.assertCommandOk(proc, '{"new_ui":{"before":null,"after":false}}')
+
+        self.assertEqual(
+            self.read_table_names(db), ["notes"], "预览不得补建 flags 表"
+        )
+        conn = sqlite3.connect(db)
+        try:
+            notes = conn.execute("SELECT id, text FROM notes").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(notes, [(1, "sample note")])
+        self.assertEqual(self.read_bytes(path), self.CANDIDATE_JSON)
+
+    def test_empty_object_missing_parent_dir_succeeds_nonempty_errors(self):
+        # 库路径父目录不存在：合法空对象预览仍成功输出 {}，不创建目录
+        # 或访问存储；相同路径改用非空文件则报 STORAGE_ERROR，退出 2、
+        # stdout 为空、stderr 仅为 STORAGE_ERROR 加换行，目录仍不存在。
+        missing_dir = os.path.join(self.tmpdir, "no_such_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+        empty_path = self.write_candidate(self.EMPTY_JSON, name="empty.json")
+        nonempty_path = self.write_candidate()
+
+        proc = self.import_flags_dry_run(db, "dev", empty_path)
+        self.assertCommandOk(proc, "{}")
+
+        self.assertFalse(os.path.exists(missing_dir), "空对象预览不得创建父目录")
+        self.assertFalse(os.path.exists(db), "空对象预览不得创建数据库文件")
+
+        proc = self.import_flags_dry_run(db, "dev", nonempty_path)
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        self.assertFalse(os.path.exists(missing_dir), "失败预览不得创建父目录")
+        self.assertFalse(os.path.exists(db), "失败预览不得创建数据库文件")
+        self.assertEqual(self.read_bytes(empty_path), self.EMPTY_JSON)
+        self.assertEqual(self.read_bytes(nonempty_path), self.CANDIDATE_JSON)
+
+    def test_stored_yes_reports_storage_error_and_keeps_value(self):
+        # 目标 new_ui 的存储文本为 yes：报 STORAGE_ERROR，退出 2、
+        # stdout 为空（不输出部分结果），原值 yes 原样保留。
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    [("dev", "new_ui", "yes"), ("qa", "new_ui", "false")],
+                )
+        finally:
+            conn.close()
+        path = self.write_candidate()
+        db_bytes = self.read_bytes(db)
+
+        proc = self.import_flags_dry_run(db, "dev", path)
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        self.assertEqual(self.read_bytes(db), db_bytes, "库文件字节必须保持不变")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "yes"), ("qa", "new_ui", "false")],
+            "异常原值必须原样保留",
+        )
+        self.assertEqual(self.read_bytes(path), self.CANDIDATE_JSON)
+
+    def test_other_env_and_unknown_key_anomalies_do_not_affect_preview(self):
+        # 其他环境（qa/new_ui=yes）与未知键（dev/other_key=maybe）的异常
+        # 值不影响合法目标的预览：输出与主样例一致，全部记录原样保留。
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    [
+                        ("dev", "new_ui", "true"),
+                        ("dev", "other_key", "maybe"),
+                        ("qa", "new_ui", "yes"),
+                    ],
+                )
+        finally:
+            conn.close()
+        path = self.write_candidate()
+        db_bytes = self.read_bytes(db)
+
+        proc = self.import_flags_dry_run(db, "dev", path)
+        self.assertCommandOk(proc, '{"new_ui":{"before":true,"after":false}}')
+
+        self.assertEqual(self.read_bytes(db), db_bytes, "库文件字节必须保持不变")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [
+                ("dev", "new_ui", "true"),
+                ("dev", "other_key", "maybe"),
+                ("qa", "new_ui", "yes"),
+            ],
+            "全部记录（含异常值）必须原样保留",
+        )
+        self.assertEqual(self.read_bytes(path), self.CANDIDATE_JSON)
 
 
 class TestExport(FlagctlCliTestCase):
