@@ -178,6 +178,23 @@
   环境与输出路径立即重试，退出 0、stderr 为空，stdout 与生成文件
   同为单行 {"new_ui": false} 加换行（无 BOM 的 UTF-8），qa 仍为
   true，源库保持原样。
+* export 写入失败后清理残缺文件再次失败的边界：有效固定样例
+  demo.sqlite（dev/new_ui 为严格文本 false、qa/new_ui 为严格文本
+  true）与内容固定的 keep.txt 同处独立临时目录，dev.json 起初不
+  存在；通过包装进程稳定制造输出文件排他创建成功、正常导出文本
+  {"new_ui": false} 加换行的前五个 UTF-8 字节已真实写入并落盘后
+  发生 OSError、随后删除这个新建文件时再次发生 OSError 的条件，
+  注入点自查并留下证据，证明两个失败确实依次发生，不能用创建之前
+  的失败代替。调用退出 2、stdout 为空、stderr 仅为
+  EXPORT_WRITE_ERROR 加换行，不包含异常消息或堆栈；dev.json 仍
+  存在且字节恰为已写入的五个字节，源库文件字节与全部记录（dev 的
+  false 不被当成未设置、qa 的设置不受影响）、keep.txt 内容保持
+  原样。同一用例中解除全部故障条件后，再以公开入口对同一环境和同
+  一输出路径正常调用一次 export：因残留文件已存在而退出 2、
+  stdout 为空、stderr 仅为 EXPORT_EXISTS 加换行，残留字节、源库与
+  keep.txt 仍保持原样。故障条件只存在于本用例的包装进程内、只作用
+  于目标输出路径，不影响样例准备或其他测试，不依赖真实磁盘耗尽、
+  权限变化或网络，重复执行结果一致。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
 每个用例使用独立的临时目录，结束后自动清理，只依赖 Python 3 标准库。
@@ -4817,6 +4834,245 @@ sys.exit(flagctl.main())
     def test_write_error_after_partial_content_removes_new_file(self):
         # 已写入部分内容后发生 OSError。
         self.check_write_failure_then_retry("partial")
+
+
+class TestExportCleanupFailure(FlagctlCliTestCase):
+    """export 写入失败后清理残缺文件本身再失败的边界回归。
+
+    对应 cmd_export() 中 ``with contextlib.suppress(OSError):
+    os.remove(file_path)`` 的删除失败分支（见 export-flow.txt 第七节）：
+    清理是“尽力而为”，os.remove() 再抛 OSError 时对外错误码仍是
+    EXPORT_WRITE_ERROR，且源码不保证残缺文件被删除。
+
+    固定样例：独立临时目录中，demo.sqlite 是有效 SQLite 库，
+    dev/new_ui 保存严格文本 false、qa/new_ui 保存严格文本 true，
+    dev.json 起初不存在，旁边另有内容固定的 keep.txt。通过包装进程
+    稳定制造两个依次发生的失败：
+
+    1. 输出文件经 os.open 排他创建成功，正常导出文本
+       ``{"new_ui": false}\\n`` 的前五个 UTF-8 字节已真实写入并落盘
+       后，文件对象的 write 抛 OSError；
+    2. cmd_export 随即调用 os.remove 清理这个新建文件时，os.remove
+       再抛 OSError。
+
+    包装进程在注入点自查并把结果写入证据文件，证明两个失败确实依次
+    发生（文件先存在、五字节先落盘、删除发生在写入失败之后），不能用
+    创建文件之前的失败代替；任一前提不满足时包装进程以 99/98/97/96
+    退出，让用例明确失败。故障注入只存在于本次导出的包装进程内、只
+    作用于目标输出路径：样例库准备走正常的公开入口，其他路径的
+    os.remove 保持真实行为，不依赖真实磁盘耗尽、操作系统权限变化或
+    网络；第二次调用使用全新的普通进程，故障条件自然解除。
+    """
+
+    # 正常导出文本（单行 JSON 加换行）与其前五个 UTF-8 字节。
+    EXPORT_BYTES = b'{"new_ui": false}\n'
+    PARTIAL_BYTES = EXPORT_BYTES[:5]
+
+    # 包装脚本：以与 ``python flagctl.py --db ... export dev dev.json``
+    # 等价的方式调用 flagctl.main()，只替换 os.fdopen 与 os.remove：
+    # 前者在五字节落盘后让 write 抛 OSError，后者在清理该新建文件时再
+    # 抛 OSError。脚本内对时序逐项自查，不满足时以特殊退出码让用例
+    # 失败，并在 main() 返回后写出两个失败均已发生的证据文件。
+    WRAPPER_TEMPLATE = '''import os
+import sys
+
+sys.path.insert(0, __HERE__)
+import flagctl
+
+TARGET = os.environ["FLAGCTL_TEST_TARGET"]
+EVIDENCE = os.environ["FLAGCTL_TEST_EVIDENCE"]
+
+real_fdopen = os.fdopen
+real_remove = os.remove
+
+state = {"write_failed": False, "remove_failed": False, "size_at_remove": None}
+
+
+class PartialThenFailWriter(object):
+    def __init__(self, fh):
+        self._fh = fh
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._fh.close()
+        return False
+
+    def write(self, data):
+        # 自查：写入失败必须发生在 os.open 排他创建成功之后，否则以
+        # 退出码 99 让用例失败（不允许用创建之前的失败代替）。
+        if not os.path.isfile(TARGET):
+            sys.exit(99)
+        # 先把正常导出文本的前五个字节真实写入并落盘。
+        self._fh.write(data[:5])
+        self._fh.flush()
+        # 自查：磁盘上必须确实留下非空的五个字节，否则退出码 98。
+        if os.path.getsize(TARGET) != 5:
+            sys.exit(98)
+        state["write_failed"] = True
+        raise OSError("simulated export write failure")
+
+
+def failing_fdopen(fd, mode, *args, **kwargs):
+    return PartialThenFailWriter(real_fdopen(fd, mode, *args, **kwargs))
+
+
+def failing_remove(path, *args, **kwargs):
+    # 自查：清理必须发生在写入失败之后，否则退出码 97。
+    if not state["write_failed"]:
+        sys.exit(97)
+    # 故障只作用于本用例的目标输出；其他路径保持真实 os.remove 行为。
+    if os.path.abspath(path) != os.path.abspath(TARGET):
+        return real_remove(path, *args, **kwargs)
+    state["size_at_remove"] = os.path.getsize(TARGET)
+    state["remove_failed"] = True
+    raise OSError("simulated export remove failure")
+
+
+os.fdopen = failing_fdopen
+os.remove = failing_remove
+
+rc = flagctl.main()
+
+# 自查：两个失败必须在本次调用中都发生过，否则退出码 96。
+if not state["write_failed"] or not state["remove_failed"]:
+    sys.exit(96)
+with open(EVIDENCE, "w", encoding="utf-8") as ef:
+    ef.write("write=" + str(int(state["write_failed"])))
+    ef.write(" remove=" + str(int(state["remove_failed"])))
+    ef.write(" size_at_remove=" + str(state["size_at_remove"]) + "\\n")
+
+sys.exit(rc)
+'''
+
+    def make_demo_db(self):
+        """固定样例库 demo.sqlite：dev/new_ui=false，qa/new_ui=true。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        return db
+
+    def write_wrapper(self):
+        """在临时目录写入故障注入包装脚本并返回路径。"""
+        wrapper = os.path.join(self.tmpdir, "failing_export_cleanup.py")
+        source = self.WRAPPER_TEMPLATE.replace("__HERE__", repr(HERE))
+        with open(wrapper, "w", encoding="utf-8") as fh:
+            fh.write(source)
+        return wrapper
+
+    def run_faulting_export(self, wrapper, db, path, evidence):
+        """在包装进程中按公开入口执行 export dev dev.json。"""
+        env = dict(os.environ)
+        env["FLAGCTL_TEST_TARGET"] = path
+        env["FLAGCTL_TEST_EVIDENCE"] = evidence
+        return subprocess.run(
+            [sys.executable, wrapper, "--db", db, "export", "dev", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+    def read_evidence(self, evidence):
+        """解析包装进程写出的 "write=1 remove=1 size_at_remove=5" 证据。"""
+        with open(evidence, "r", encoding="utf-8") as fh:
+            tokens = fh.read().split()
+        return dict(token.split("=", 1) for token in tokens)
+
+    def test_write_failure_then_cleanup_failure_keeps_partial_file(self):
+        db = self.make_demo_db()
+        path = os.path.join(self.tmpdir, "dev.json")
+        self.assertFalse(os.path.exists(path), "dev.json 起初必须不存在")
+        # 旁边内容固定的文件：两次调用都不得改动它。
+        sentinel = os.path.join(self.tmpdir, "keep.txt")
+        with open(sentinel, "wb") as fh:
+            fh.write(b"untouched\n")
+        wrapper = self.write_wrapper()
+        evidence = os.path.join(self.tmpdir, "cleanup_failure_evidence.txt")
+        self.assertFalse(os.path.exists(evidence))
+
+        with open(db, "rb") as fh:
+            db_bytes_before = fh.read()
+        rows_before = self.read_flags_rows(db)
+        self.assertEqual(
+            rows_before,
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+
+        # 调用一：文件创建成功、前五个字节写入后 write 失败，随后删除
+        # 该新建文件再次失败。
+        proc = self.run_faulting_export(wrapper, db, path, evidence)
+
+        # 退出 2、stdout 为空、stderr 严格为 EXPORT_WRITE_ERROR 加换行；
+        # 包装进程若在创建之前失败、五字节未落盘或删除先于写入失败，
+        # 会以 99/98/97/96 退出，下面的断言随之明确失败。
+        self.assertEqual(
+            proc.returncode, 2, "期望退出码 2，实际: %r stderr: %r"
+            % (proc.returncode, proc.stderr)
+        )
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(proc.stderr, "EXPORT_WRITE_ERROR\n")
+        self.assertNotIn("Traceback", proc.stderr, "stderr 不得包含堆栈")
+        self.assertNotIn("simulated", proc.stderr, "stderr 不得包含异常消息")
+
+        # 证据证明两个失败确实依次发生，且删除时文件里已有五个字节。
+        self.assertTrue(os.path.exists(evidence), "包装进程必须写出注入证据")
+        self.assertEqual(
+            self.read_evidence(evidence),
+            {"write": "1", "remove": "1", "size_at_remove": "5"},
+        )
+
+        # 清理失败：残缺文件仍存在，内容恰为已写入的五个字节。
+        self.assertTrue(os.path.isfile(path), "清理失败后 dev.json 必须仍存在")
+        self.assertEqual(
+            self.read_file_bytes(path),
+            self.PARTIAL_BYTES,
+            "残留内容必须恰为正常导出文本的前五个 UTF-8 字节",
+        )
+        self.assertTrue(
+            self.EXPORT_BYTES.startswith(self.PARTIAL_BYTES),
+            "五个字节必须是正常导出文本的前缀",
+        )
+
+        # 源库文件字节、全部记录保持原样：dev 的 false 是实际设置而非
+        # 未设置，qa 的设置不受影响。
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), db_bytes_before, "源库字节必须保持不变")
+        self.assertEqual(self.read_flags_rows(db), rows_before, "源库记录必须保持不变")
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+        with open(sentinel, "rb") as fh:
+            self.assertEqual(fh.read(), b"untouched\n", "keep.txt 必须保持原样")
+
+        # 调用二：在同一用例中解除全部故障条件（改用不带任何注入的全新
+        # 普通进程，仍按公开入口调用），对同一环境和同一输出路径再次
+        # export。残留文件已经存在，只能报 EXPORT_EXISTS。
+        listing_after_first = sorted(os.listdir(self.tmpdir))
+        retry = self.export_flags(db, "dev", path)
+        self.assertCommandError(retry, "EXPORT_EXISTS")
+        self.assertNotIn("Traceback", retry.stderr)
+
+        # 残留字节保持不变，源库与 keep.txt 仍保持原样。
+        self.assertEqual(
+            self.read_file_bytes(path),
+            self.PARTIAL_BYTES,
+            "EXPORT_EXISTS 不得改动残留文件的字节",
+        )
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), db_bytes_before, "第二次调用后源库字节仍不变")
+        self.assertEqual(
+            self.read_flags_rows(db), rows_before, "第二次调用后源库记录仍不变"
+        )
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+        with open(sentinel, "rb") as fh:
+            self.assertEqual(fh.read(), b"untouched\n", "keep.txt 仍必须保持原样")
+        self.assertEqual(
+            sorted(os.listdir(self.tmpdir)),
+            listing_after_first,
+            "第二次调用不得新增或丢失任何文件",
+        )
 
 
 if __name__ == "__main__":
