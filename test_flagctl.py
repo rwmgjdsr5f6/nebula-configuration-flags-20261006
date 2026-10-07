@@ -1837,6 +1837,70 @@ class TestImport(FlagctlCliTestCase):
 
         self.assertFalse(os.path.exists(db), "校验失败不得创建数据库: %s" % db)
 
+    def test_nonstandard_numeric_constants_report_invalid_json(self):
+        # 未加引号的 NaN、Infinity、-Infinity 不是合法 JSON，无论出现在
+        # 顶层、对象值还是嵌套结构中，都在键名与布尔值校验之前报
+        # INVALID_JSON。
+        for index, content in enumerate(
+            [
+                '{"new_ui": NaN}',
+                '{"new_ui": Infinity}',
+                '{"new_ui": -Infinity}',
+                'NaN',
+                'Infinity',
+                '-Infinity',
+                '{"other_key": [NaN]}',
+                '{"other_key": {"k": Infinity}}',
+                '{"new_ui": [-Infinity]}',
+                '{"new_ui": NaN, "other_key": true}',
+            ]
+        ):
+            with self.subTest(content=content):
+                db = self.db_path("import_constant_%d" % index)
+                self.assertCommandOk(
+                    self.set_flag(db, "dev", "new_ui", "true"), "true"
+                )
+                path = self.write_import_file(
+                    content, name="constant_%d.json" % index
+                )
+
+                self.assertCommandError(
+                    self.import_flags(db, "dev", path), "INVALID_JSON"
+                )
+
+                # 语法失败先于键名/布尔值校验，既有记录保持不变。
+                self.assertEqual(
+                    self.read_flags_rows(db), [("dev", "new_ui", "true")]
+                )
+
+    def test_quoted_constant_text_is_not_syntax_error(self):
+        # 引号内的 NaN 只是普通字符串：语法合法，作为开关值报 INVALID_BOOL。
+        db = self.db_path("import_quoted_constant")
+        path = self.write_import_file('{"new_ui": "NaN"}')
+
+        self.assertCommandError(self.import_flags(db, "dev", path), "INVALID_BOOL")
+
+        self.assertFalse(os.path.exists(db), "校验失败不得创建数据库: %s" % db)
+
+    def test_key_named_constant_is_unknown_key(self):
+        # 键名为 NaN 是合法字符串键，走未知键校验：报 UNKNOWN_KEY。
+        db = self.db_path("import_constant_key")
+        path = self.write_import_file('{"NaN": true}')
+
+        self.assertCommandError(self.import_flags(db, "dev", path), "UNKNOWN_KEY")
+
+        self.assertFalse(os.path.exists(db), "校验失败不得创建数据库: %s" % db)
+
+    def test_overflow_number_value_reports_invalid_bool(self):
+        # 合法 JSON 数字 1e999（解析为 inf）不是语法问题，作为开关值
+        # 仍报 INVALID_BOOL。
+        db = self.db_path("import_overflow_number")
+        path = self.write_import_file('{"new_ui": 1e999}')
+
+        self.assertCommandError(self.import_flags(db, "dev", path), "INVALID_BOOL")
+
+        self.assertFalse(os.path.exists(db), "校验失败不得创建数据库: %s" % db)
+
     def test_unknown_key_rejected(self):
         # 未知键报 UNKNOWN_KEY，既有记录保持不变。
         db = self.db_path("import_unknown_key")

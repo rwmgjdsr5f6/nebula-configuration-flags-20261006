@@ -212,6 +212,16 @@ def cmd_diff(db_path, left_env, right_env):
     return result
 
 
+def _reject_constant(value):
+    """json.loads 的 parse_constant：拒绝非标准数值常量。
+
+    标准 JSON 不包含 NaN、Infinity、-Infinity，Python 的 json 解析器
+    默认却接受它们。这些字面量在解码阶段（键名、布尔值校验之前）
+    出现即按语法错误拒绝；引号内的同名文本是普通字符串，不会走到这里。
+    """
+    raise FlagError("INVALID_JSON")
+
+
 def _unique_object_pairs(pairs):
     """json.loads 的 object_pairs_hook：发现重复键即拒绝整个文件。"""
     result = {}
@@ -228,7 +238,8 @@ def load_import_file(file_path):
     校验全部在访问数据库之前完成，失败时不触碰任何存储：
 
     * 文件不存在或无法读取 -> IMPORT_READ_ERROR；
-    * 非法 UTF-8、JSON 语法错误、顶层不是对象、存在重复键 -> INVALID_JSON；
+    * 非法 UTF-8、JSON 语法错误、顶层不是对象、存在重复键、出现
+      未加引号的 NaN/Infinity/-Infinity -> INVALID_JSON；
     * 先校验全部键名，未知键 -> UNKNOWN_KEY；
     * 再校验全部值，非 JSON 布尔值 -> INVALID_BOOL。
     """
@@ -242,7 +253,11 @@ def load_import_file(file_path):
     except UnicodeDecodeError:
         raise FlagError("INVALID_JSON")
     try:
-        data = json.loads(text, object_pairs_hook=_unique_object_pairs)
+        data = json.loads(
+            text,
+            object_pairs_hook=_unique_object_pairs,
+            parse_constant=_reject_constant,
+        )
     except FlagError:
         raise
     except ValueError:
