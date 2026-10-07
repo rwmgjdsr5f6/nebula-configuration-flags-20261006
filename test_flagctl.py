@@ -90,6 +90,18 @@
   后再预览输出 {"new_ui":{"before":true,"after":false}}，两次调用
   均不改变数据库记录、表结构、文件字节与输入文件，预览后 dev 仍为
   true、qa 仍为 false。
+* import 与 import --dry-run 对重复 JSON 键的一致拒绝：固定样例
+  demo.sqlite（仅 dev/new_ui=true 与 qa/new_ui=false）与 UTF-8 的
+  candidate.json，同一份输入用普通导入与只读预览两种方式调用，
+  拒绝结果必须一致——{"new_ui":true,"new_ui":false} 转义
+  解码后键名相同、{"new_ui":{"x":1,"x":2}} 与
+  {"other_key":{"x":1,"x":2}} 的嵌套对象重复键均报 INVALID_JSON
+  （重复键判定先于布尔值与未知键校验），对照输入
+  {"new_ui":[{"x":1},{"x":2}]} 报 INVALID_BOOL（不同对象各自出现
+  一次 x 不构成重复，数组不是合法开关值）；每次失败退出 2、stdout
+  为空、stderr 仅为错误码加换行，调用后 candidate.json 字节、库
+  文件字节与全部配置记录保持原样；父目录已存在而库文件尚不存在
+  的路径上拒绝结果相同，且解析失败不创建库文件。
 * export 把单环境已保存的直接设置导出为 JSON 文件：固定样例
   dev/new_ui=false、qa/new_ui=true 导出 dev 得到 {"new_ui": false}，
   stdout 与文件同为单行 JSON 加换行（无 BOM），再导入另一库的
@@ -3019,6 +3031,120 @@ class TestImportDryRunSequentialContrast(FlagctlCliTestCase):
         self.assertEqual(self.read_flags_columns(db), ["env", "key", "value"])
         self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
         self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+
+class TestImportDuplicateKeyRejection(FlagctlCliTestCase):
+    """import 与 import --dry-run 对重复 JSON 键的一致拒绝回归。
+
+    固定样例 demo.sqlite 只含 dev/new_ui=true 与 qa/new_ui=false，
+    candidate.json 为 UTF-8 文本。同一份输入分别用普通导入
+    （import dev candidate.json）与只读预览（附加 --dry-run）调用，
+    两种方式必须给出一致的拒绝结果，且输入校验先于访问数据库：
+
+    * {"new_ui":true,"\\u006eew_ui":false}：转义解码后两个键名都是
+      new_ui，两种方式均报 INVALID_JSON；
+    * {"new_ui":{"x":1,"x":2}} 与 {"other_key":{"x":1,"x":2}}：嵌套
+      对象的重复键先于布尔值与未知键校验，均报 INVALID_JSON；
+    * {"new_ui":[{"x":1},{"x":2}]}：对照组——不同对象各自出现一次
+      x 不构成重复，但数组不是合法开关值，均报 INVALID_BOOL。
+
+    每次失败退出 2、stdout 为空、stderr 仅为错误码加换行，没有堆栈
+    或部分预览结果；各用例独立准备输入，调用后 candidate.json 的
+    原始字节、库文件字节与全部配置记录保持原样。另在父目录已存在、
+    库文件尚不存在的路径上验证同样的拒绝结果，确认解析失败不会顺手
+    创建配置库。
+    """
+
+    # (candidate.json 的原始字节, 期望错误码)；每种输入对普通导入与
+    # --dry-run 预览都必须得到同一个错误码。
+    CASES = [
+        (b'{"new_ui":true,"\\u006eew_ui":false}', "INVALID_JSON"),
+        (b'{"new_ui":{"x":1,"x":2}}', "INVALID_JSON"),
+        (b'{"other_key":{"x":1,"x":2}}', "INVALID_JSON"),
+        (b'{"new_ui":[{"x":1},{"x":2}]}', "INVALID_BOOL"),
+    ]
+
+    def make_demo_db(self, name):
+        """固定样例库：仅 dev/new_ui=true 与 qa/new_ui=false。"""
+        db = os.path.join(self.tmpdir, name)
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "false")],
+        )
+        return db
+
+    def write_candidate(self, content, name):
+        """按指定文件名写入 candidate 的原始字节并返回路径。"""
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(content)
+        return path
+
+    def assert_rejected_by_both_modes(self, db, candidate, code):
+        """同一输入在普通导入与 --dry-run 预览下得到同一拒绝结果。"""
+        for mode, invoke in [
+            ("import", self.import_flags),
+            ("dry-run", self.preview_flags),
+        ]:
+            with self.subTest(mode=mode):
+                proc = invoke(db, "dev", candidate)
+                self.assertCommandError(proc, code)
+
+    def test_rejection_consistent_between_import_and_dry_run(self):
+        # 每份输入各自准备独立的 demo.sqlite 与 candidate.json：两种
+        # 调用方式报同一错误码，且调用后输入文件字节、库文件字节与
+        # dev/qa 记录全部保持原样。
+        for index, (content, code) in enumerate(self.CASES):
+            with self.subTest(content=content):
+                db = self.make_demo_db("demo_%d.sqlite" % index)
+                candidate = self.write_candidate(
+                    content, "candidate_%d.json" % index
+                )
+                db_bytes = self.read_file_bytes(db)
+
+                self.assert_rejected_by_both_modes(db, candidate, code)
+
+                self.assertEqual(
+                    self.read_file_bytes(candidate),
+                    content,
+                    "调用不得改动输入文件",
+                )
+                self.assertEqual(
+                    self.read_file_bytes(db),
+                    db_bytes,
+                    "校验失败不得改动库文件",
+                )
+                self.assertEqual(
+                    self.read_flags_rows(db),
+                    [("dev", "new_ui", "true"), ("qa", "new_ui", "false")],
+                )
+                self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
+                self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+    def test_rejection_on_missing_db_does_not_create_db_file(self):
+        # 父目录已存在、库文件尚不存在：同样的输入得到同样的拒绝结果，
+        # 且解析失败不会顺手创建配置库。
+        for index, (content, code) in enumerate(self.CASES):
+            with self.subTest(content=content):
+                db = os.path.join(self.tmpdir, "missing_%d.sqlite" % index)
+                self.assertTrue(os.path.isdir(self.tmpdir))
+                self.assertFalse(os.path.exists(db))
+                candidate = self.write_candidate(
+                    content, "candidate_missing_%d.json" % index
+                )
+
+                self.assert_rejected_by_both_modes(db, candidate, code)
+
+                self.assertFalse(
+                    os.path.exists(db), "解析失败不得创建数据库文件: %s" % db
+                )
+                self.assertEqual(
+                    self.read_file_bytes(candidate),
+                    content,
+                    "调用不得改动输入文件",
+                )
 
 
 class TestExport(FlagctlCliTestCase):
