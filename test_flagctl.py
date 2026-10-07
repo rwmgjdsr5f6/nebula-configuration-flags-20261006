@@ -90,6 +90,18 @@
   后再预览输出 {"new_ui":{"before":true,"after":false}}，两次调用
   均不改变数据库记录、表结构、文件字节与输入文件，预览后 dev 仍为
   true、qa 仍为 false。
+* import 与 import --dry-run 对重复 JSON 键的一致拒绝：固定样例
+  demo.sqlite 只保存 dev/new_ui=true 与 qa/new_ui=false，
+  candidate.json 为 UTF-8 文本；{"new_ui":true,"\\u006eew_ui":false}
+  的转义解码后键名相同，{"new_ui":{"x":1,"x":2}} 与
+  {"other_key":{"x":1,"x":2}} 的嵌套重复键先于布尔值与未知键
+  校验，两种导入方式均报 INVALID_JSON；对照样例
+  {"new_ui":[{"x":1},{"x":2}]} 中不同对象各自出现一次 x 不构成
+  重复，数组不是合法开关值，均报 INVALID_BOOL。每次失败退出 2、
+  stdout 为空、stderr 仅为错误码加换行；各用例独立准备输入，调用
+  后 candidate.json 字节、库文件字节与全部记录保持原样，dev 与
+  qa 不被覆盖；父目录存在而库文件缺失时拒绝结果相同且不创建库
+  文件。
 * export 把单环境已保存的直接设置导出为 JSON 文件：固定样例
   dev/new_ui=false、qa/new_ui=true 导出 dev 得到 {"new_ui": false}，
   stdout 与文件同为单行 JSON 加换行（无 BOM），再导入另一库的
@@ -3019,6 +3031,153 @@ class TestImportDryRunSequentialContrast(FlagctlCliTestCase):
         self.assertEqual(self.read_flags_columns(db), ["env", "key", "value"])
         self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
         self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+
+class TestImportDuplicateKeyRejection(FlagctlCliTestCase):
+    """import 与 import --dry-run 对重复 JSON 键的一致拒绝回归。
+
+    固定样例：demo.sqlite 只保存 dev/new_ui=true 与 qa/new_ui=false，
+    candidate.json 为 UTF-8 文本。每份输入都分别以正式导入
+    （import dev candidate.json）与只读预览（同一命令附加
+    --dry-run）调用，两种导入方式对同一文件必须给出一致的拒绝
+    结果，且输入校验先于任何数据库访问：
+
+    * {"new_ui":true,"\\u006eew_ui":false}：\\u006e 解码为 n，
+      两个键解码后都是 new_ui，均报 INVALID_JSON；
+    * {"new_ui":{"x":1,"x":2}} 与 {"other_key":{"x":1,"x":2}}：
+      嵌套对象内的重复键先于布尔值与未知键校验，均报 INVALID_JSON；
+    * {"new_ui":[{"x":1},{"x":2}]}（对照）：不同对象各自出现一次
+      x 不构成重复，数组本身不是合法开关值，均报 INVALID_BOOL。
+
+    每次失败退出 2、stdout 为空、stderr 仅为对应错误码加换行，没有
+    堆栈或部分预览结果。各用例独立准备输入，调用后 candidate.json
+    原始字节、库文件字节与全部配置记录保持原样，dev 与 qa 的设置
+    不被覆盖。另在父目录已存在、库文件尚不存在的路径上验证同样的
+    拒绝结果，调用结束后库文件仍不存在——解析失败不会顺手创建
+    配置库。
+    """
+
+    # 固定样例库的完整记录（按主键升序）。
+    DEMO_ROWS = [("dev", "new_ui", "true"), ("qa", "new_ui", "false")]
+
+    def make_case_dir(self, label, mode):
+        """为（用例, 导入方式）组合创建独立目录，保证各用例独立准备输入。"""
+        case_dir = os.path.join(self.tmpdir, "%s_%s" % (label, mode))
+        os.mkdir(case_dir)
+        return case_dir
+
+    def make_demo_db(self, case_dir):
+        """在指定目录创建固定样例库 demo.sqlite：dev=true、qa=false。"""
+        db = os.path.join(case_dir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        self.assertEqual(self.read_flags_rows(db), self.DEMO_ROWS)
+        return db
+
+    def write_candidate(self, case_dir, content):
+        """在指定目录以固定文件名 candidate.json 写入原始字节。"""
+        path = os.path.join(case_dir, "candidate.json")
+        with open(path, "wb") as fh:
+            fh.write(content)
+        return path
+
+    def run_import_mode(self, mode, db, candidate):
+        """按导入方式执行：正式导入或附加 --dry-run 的只读预览。"""
+        if mode == "import":
+            return self.import_flags(db, "dev", candidate)
+        return self.preview_flags(db, "dev", candidate)
+
+    def check_rejected_consistently(self, label, content, code):
+        """同一输入在正式导入与只读预览下得到同一拒绝结果且现场不变。"""
+        for mode in ("import", "dry-run"):
+            with self.subTest(content=content, mode=mode):
+                case_dir = self.make_case_dir(label, mode)
+                db = self.make_demo_db(case_dir)
+                candidate = self.write_candidate(case_dir, content)
+                db_bytes = self.read_file_bytes(db)
+
+                proc = self.run_import_mode(mode, db, candidate)
+
+                # 退出 2、stdout 为空、stderr 仅为错误码加换行。
+                self.assertCommandError(proc, code)
+                # 输入文件与库文件字节、表结构与全部记录保持原样。
+                self.assertEqual(
+                    self.read_file_bytes(candidate),
+                    content,
+                    "调用不得改动输入文件 candidate.json",
+                )
+                self.assertEqual(
+                    self.read_file_bytes(db),
+                    db_bytes,
+                    "校验失败不得改动库文件字节",
+                )
+                self.assertEqual(self.read_table_names(db), ["flags"])
+                self.assertEqual(
+                    self.read_flags_columns(db), ["env", "key", "value"]
+                )
+                self.assertEqual(self.read_flags_rows(db), self.DEMO_ROWS)
+                # dev 与 qa 的设置不被覆盖。
+                self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
+                self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+    def check_rejected_without_creating_db(self, label, content, code):
+        """父目录存在、库文件不存在：同一拒绝结果，且不创建库文件。"""
+        for mode in ("import", "dry-run"):
+            with self.subTest(content=content, mode=mode):
+                case_dir = self.make_case_dir(label + "_fresh", mode)
+                db = os.path.join(case_dir, "demo.sqlite")
+                self.assertFalse(os.path.exists(db))
+                candidate = self.write_candidate(case_dir, content)
+
+                proc = self.run_import_mode(mode, db, candidate)
+
+                self.assertCommandError(proc, code)
+                self.assertFalse(
+                    os.path.exists(db),
+                    "解析失败不得顺手创建数据库文件: %s" % db,
+                )
+                self.assertEqual(
+                    self.read_file_bytes(candidate),
+                    content,
+                    "调用不得改动输入文件 candidate.json",
+                )
+
+    def test_escaped_duplicate_key_rejected(self):
+        # 文件内容 {"new_ui":true,"\u006eew_ui":false} 中的 JSON 转义
+        # \u006e 解码为 n，两个键解码后都是 new_ui，构成顶层重复键。
+        content = b'{"new_ui":true,"\\u006eew_ui":false}'
+        self.check_rejected_consistently("escaped_dup", content, "INVALID_JSON")
+        self.check_rejected_without_creating_db(
+            "escaped_dup", content, "INVALID_JSON"
+        )
+
+    def test_nested_duplicate_under_known_key_rejected(self):
+        # {"new_ui":{"x":1,"x":2}}：嵌套对象内的重复键在解析阶段即被
+        # 拒绝，先于布尔值校验（对象本身也不是合法开关值）。
+        content = b'{"new_ui":{"x":1,"x":2}}'
+        self.check_rejected_consistently("nested_known", content, "INVALID_JSON")
+        self.check_rejected_without_creating_db(
+            "nested_known", content, "INVALID_JSON"
+        )
+
+    def test_nested_duplicate_under_unknown_key_rejected(self):
+        # {"other_key":{"x":1,"x":2}}：嵌套重复键的拒绝先于未知键
+        # 校验，报 INVALID_JSON 而非 UNKNOWN_KEY。
+        content = b'{"other_key":{"x":1,"x":2}}'
+        self.check_rejected_consistently("nested_unknown", content, "INVALID_JSON")
+        self.check_rejected_without_creating_db(
+            "nested_unknown", content, "INVALID_JSON"
+        )
+
+    def test_distinct_objects_in_array_are_not_duplicates(self):
+        # 对照样例 {"new_ui":[{"x":1},{"x":2}]}：两个不同对象各自
+        # 出现一次 x 不构成重复键，解析通过；数组不是合法开关值，
+        # 报 INVALID_BOOL。
+        content = b'{"new_ui":[{"x":1},{"x":2}]}'
+        self.check_rejected_consistently("array_control", content, "INVALID_BOOL")
+        self.check_rejected_without_creating_db(
+            "array_control", content, "INVALID_BOOL"
+        )
 
 
 class TestExport(FlagctlCliTestCase):
