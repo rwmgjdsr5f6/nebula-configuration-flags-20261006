@@ -66,6 +66,22 @@ def parse_bool(text):
     raise FlagError("INVALID_BOOL")
 
 
+def stored_bool_text(value):
+    """已保存布尔值的唯一读取校验规则，get/list/envs（及经 list 的
+    diff）共用这一份。
+
+    flags 表中合法的已保存值只有严格文本 "true" / "false"：不修剪
+    空白、不转换大小写，也不接受 "yes"、"1" 等其他写法。校验通过时
+    原样返回该文本（get 直接输出，list/envs 据此映射）；值非法一律
+    按存储数据损坏报 STORAGE_ERROR。读取范围（目标记录、目标环境或
+    全库）由各调用方通过 SQL 与 KNOWN_KEYS 过滤决定，本函数只负责
+    单条值的判定，不做查询、不修复记录。
+    """
+    if value == "true" or value == "false":
+        return value
+    raise FlagError("STORAGE_ERROR")
+
+
 def connect(db_path):
     try:
         return sqlite3.connect(db_path)
@@ -124,9 +140,9 @@ def cmd_get(db_path, env, key):
     """读取目标记录的布尔值，纯只读、不修复异常数据。
 
     目标记录不存在报 VALUE_NOT_SET；记录存在但值不是严格的文本
-    true/false 时与 list 一样视为存储数据损坏，报 STORAGE_ERROR：
-    不做大小写转换、不去除空白、不输出原值。只检查目标记录，其他
-    环境的异常值不在本次读取范围内。
+    true/false 时与 list/envs 走同一份校验（stored_bool_text()），
+    视为存储数据损坏，报 STORAGE_ERROR：不做大小写转换、不去除空白、
+    不输出原值。只检查目标记录，其他环境的异常值不在本次读取范围内。
     """
     with open_flag_store(db_path) as conn:
         row = conn.execute(
@@ -134,9 +150,7 @@ def cmd_get(db_path, env, key):
         ).fetchone()
     if row is None:
         raise FlagError("VALUE_NOT_SET")
-    if row[0] != "true" and row[0] != "false":
-        raise FlagError("STORAGE_ERROR")
-    return row[0]
+    return stored_bool_text(row[0])
 
 
 def cmd_unset(db_path, env, key):
@@ -162,8 +176,9 @@ def cmd_list(db_path, env):
     flags 表）翻译为 list 语义下的空结果；其余 STORAGE_ERROR 原样
     向上传递。
 
-    未知键不出现在结果中；已知键若存有 true/false 之外的值，
-    报 STORAGE_ERROR，不输出部分结果。
+    未知键不出现在结果中；已知键的值校验完全复用唯一一份规则
+    stored_bool_text()，存有 true/false 之外的值时报 STORAGE_ERROR，
+    不输出部分结果。
     """
     try:
         with open_flag_store(db_path) as conn:
@@ -177,14 +192,11 @@ def cmd_list(db_path, env):
         raise
     result = {}
     for key, value in rows:
+        # list 只检查目标环境的已知键：未知键整行忽略，其异常值不影响
+        # 结果；已知键则交给统一规则校验并映射为 JSON 布尔值。
         if key not in KNOWN_KEYS:
             continue
-        if value == "true":
-            result[key] = True
-        elif value == "false":
-            result[key] = False
-        else:
-            raise FlagError("STORAGE_ERROR")
+        result[key] = stored_bool_text(value) == "true"
     return result
 
 
@@ -313,10 +325,12 @@ def cmd_envs(db_path):
     向上传递。
 
     只有已知键的行参与判断，未知键（含其异常值）一律忽略：只含未知
-    键的环境不出现；任一已知键存有 true/false 之外的值都视为存储
-    数据损坏，报 STORAGE_ERROR，不输出部分名单。同名环境去重，按
-    名称的 Unicode 码点字典序（Python 默认字符串序）升序；名称按
-    库中保存的文本原样输出，不去除空白、不转换大小写。
+    键的环境不出现；已知键的值校验完全复用唯一一份规则
+    stored_bool_text()，任一已知键存有 true/false 之外的值都视为
+    存储数据损坏，报 STORAGE_ERROR，不输出部分名单。false 通过同一
+    校验，因此也算已设置。同名环境去重，按名称的 Unicode 码点字典
+    序（Python 默认字符串序）升序；名称按库中保存的文本原样输出，
+    不去除空白、不转换大小写。
     """
     try:
         with open_flag_store(db_path) as conn:
@@ -328,10 +342,11 @@ def cmd_envs(db_path):
         raise
     envs = set()
     for env, key, value in rows:
+        # envs 检查全库已知键：未知键整行忽略；已知键统一校验，非法
+        # 即报 STORAGE_ERROR，合法（含 false）则把环境原样计入。
         if key not in KNOWN_KEYS:
             continue
-        if value != "true" and value != "false":
-            raise FlagError("STORAGE_ERROR")
+        stored_bool_text(value)
         envs.add(env)
     return sorted(envs)
 

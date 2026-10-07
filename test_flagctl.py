@@ -1675,6 +1675,106 @@ class TestEnvs(FlagctlCliTestCase):
         self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
 
 
+class TestFixedSampleReadValidation(FlagctlCliTestCase):
+    """固定样例 demo.sqlite 下统一读取校验的端到端回归。
+
+    flags 表仅保存 dev/new_ui=false 与 qa/new_ui=yes 两行（yes 绕过
+    set 的输入校验直接落库，模拟存储中已存在的异常值）。重构后三处
+    入口共用同一份已保存布尔值校验规则，本类固定：
+
+    * get dev new_ui 只检查目标记录，输出 false；
+    * list dev 只检查目标环境，输出 {"new_ui": false}，qa 的异常值
+      在范围外；
+    * envs 检查全库已知键，qa 的 yes 令其报 STORAGE_ERROR，dev 的
+      false 不产生部分结果；
+    * get/list 直接读 qa、diff 以 qa 为任一侧（间接复用 list 的
+      读取校验）同样报 STORAGE_ERROR，左右顺序不影响结论；
+    * 所有读取前后两行记录逐行不变，且读取不产生修复或写入。
+    """
+
+    def seed_demo_db(self, label):
+        """建立固定样例库，返回其路径：仅 dev=false、qa=new_ui=yes 两行。"""
+        db = self.db_path(label)
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    [("dev", "new_ui", "false"), ("qa", "new_ui", "yes")],
+                )
+        finally:
+            conn.close()
+        return db
+
+    def test_get_dev_outputs_false(self):
+        # get dev new_ui：退出 0，stdout 严格为 false 加换行，stderr 为空。
+        db = self.seed_demo_db("demo_get")
+        proc = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandOk(proc, "false")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "yes")],
+        )
+
+    def test_envs_reports_storage_error_and_rows_unchanged(self):
+        # envs：退出 2，stdout 为空，stderr 仅 STORAGE_ERROR 加换行；
+        # 执行前后记录（含 qa 的非法原值 yes）逐行保持不变。
+        db = self.seed_demo_db("demo_envs")
+        before = self.read_flags_rows(db)
+
+        proc = self.envs_flags(db)
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_rows(db), before)
+
+    def test_get_then_envs_on_same_db_both_match_fixed_sample(self):
+        # 固定验收流程：同一个 demo.sqlite 上先 get dev new_ui 输出
+        # false，再执行 envs 返回 STORAGE_ERROR；两次读取前后记录不变。
+        db = self.seed_demo_db("demo_flow")
+        before = self.read_flags_rows(db)
+
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+        self.assertEqual(self.read_flags_rows(db), before)
+
+        self.assertCommandError(self.envs_flags(db), "STORAGE_ERROR")
+        self.assertEqual(self.read_flags_rows(db), before)
+
+    def test_list_dev_ok_while_list_qa_errors(self):
+        # list 只检查目标环境的已知键：dev 输出 {"new_ui": false}，
+        # qa 范围外的异常值不影响它；直接 list qa 则报 STORAGE_ERROR。
+        db = self.seed_demo_db("demo_list")
+
+        proc = self.list_flags(db, "dev")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(proc.stdout), {"new_ui": False})
+
+        self.assertCommandError(self.list_flags(db, "qa"), "STORAGE_ERROR")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "yes")],
+        )
+
+    def test_get_qa_errors_and_diff_with_qa_on_either_side_errors(self):
+        # 直接读 qa 的非法记录报 STORAGE_ERROR；diff 间接复用 list 的
+        # 读取校验，qa 在左或在右都报 STORAGE_ERROR，不输出部分差异，
+        # 记录原样保留。
+        db = self.seed_demo_db("demo_diff")
+
+        self.assertCommandError(self.get_flag(db, "qa", "new_ui"), "STORAGE_ERROR")
+        self.assertCommandError(self.diff_flags(db, "dev", "qa"), "STORAGE_ERROR")
+        self.assertCommandError(self.diff_flags(db, "qa", "dev"), "STORAGE_ERROR")
+
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "yes")],
+        )
+
+
 class TestImport(FlagctlCliTestCase):
     """import 从 JSON 文件导入一个环境的直接设置。
 
