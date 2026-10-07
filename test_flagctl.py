@@ -64,6 +64,16 @@
   相同报 EXPORT_WRITE_ERROR，输出已存在报 EXPORT_EXISTS 且原内容
   保留，输出父目录缺失报 EXPORT_WRITE_ERROR 且不创建目录；成功与
   失败路径下源库字节均保持不变。
+* export 在文件创建之后写入失败的文件保护：固定样例库 demo.sqlite
+  （dev/new_ui=false、qa/new_ui=true）导出 dev 到起初不存在的
+  dev.json，文件已创建但尚未写入内容与已写入部分内容后两种 OSError
+  场景均退出 2、stdout 为空、stderr 仅为 EXPORT_WRITE_ERROR 加换行，
+  调用结束后 dev.json 不残留，源库全部记录与文件字节、临时目录内
+  其他文件保持原样；注入点自身校验失败确实发生在文件创建之后
+  （部分写入场景确实产生过非空内容）；恢复正常写入条件后以相同
+  环境与输出路径立即重试，退出 0、stderr 为空，stdout 与生成文件
+  同为单行 {"new_ui": false} 加换行（无 BOM 的 UTF-8），qa 仍为
+  true，源库保持原样。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
 每个用例使用独立的临时目录，结束后自动清理，只依赖 Python 3 标准库。
@@ -2519,6 +2529,161 @@ class TestExport(FlagctlCliTestCase):
 
         with open(db, "rb") as fh:
             self.assertEqual(fh.read(), before)
+
+
+class TestExportWriteFailureCleanup(FlagctlCliTestCase):
+    """export 在输出文件创建之后写入失败时的文件保护回归。
+
+    固定样例库 demo.sqlite 保存 dev/new_ui=false 与 qa/new_ui=true，
+    输出路径 dev.json 起初不存在。通过包装进程在 os.fdopen 返回的
+    文件对象上注入 OSError，分别模拟两种失败：
+
+    * empty：文件已创建但尚未写入任何内容时写入失败；
+    * partial：已真实写入并落盘一部分非空内容后写入失败。
+
+    两种情况都必须退出 2、stdout 为空、stderr 仅为 EXPORT_WRITE_ERROR
+    加换行；调用结束后 dev.json 不存在，源库全部记录与文件字节、
+    临时目录内原有的其他文件保持原样。注入点自身会校验失败确实发生
+    在文件创建之后（partial 场景还校验确实产生过非空内容），否则以
+    特殊退出码让用例明确失败，不允许用创建文件之前的失败代替。
+    每个失败样例恢复正常写入条件后，立即用相同环境和输出路径重试
+    导出：退出 0、stderr 为空，stdout 与生成文件同为单行
+    {"new_ui": false} 加换行（无 BOM 的 UTF-8），qa 仍为 true，
+    源库保持原样。失败条件只作用于本次导出的包装进程，不影响样例
+    库准备、重试和其他用例。
+    """
+
+    # 包装脚本：以与 ``python flagctl.py --db ... export dev ...`` 等价
+    # 的方式调用 flagctl.main()，仅把 os.fdopen 换成注入失败的版本。
+    # 失败注入发生在 os.open 排他创建文件之后，因此异常必然出现在
+    # 文件创建之后；脚本内对此自查，不满足时以 99/98 退出让用例失败。
+    WRAPPER_TEMPLATE = '''import os
+import sys
+
+sys.path.insert(0, {here!r})
+import flagctl
+
+MODE = os.environ["FLAGCTL_TEST_FAIL_MODE"]
+TARGET = os.environ["FLAGCTL_TEST_TARGET"]
+
+real_fdopen = os.fdopen
+
+
+class FailingWriter(object):
+    def __init__(self, fh):
+        self._fh = fh
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._fh.close()
+        return False
+
+    def write(self, data):
+        # 自查：异常必须发生在文件创建之后，否则以退出码 99 让用例失败。
+        if not os.path.isfile(TARGET):
+            sys.exit(99)
+        if MODE == "partial":
+            # 先真实写入一部分字节并落盘，确认产生了非空内容后再失败；
+            # 若文件仍为空，以退出码 98 让用例失败。
+            self._fh.write(data[:5])
+            self._fh.flush()
+            if os.path.getsize(TARGET) == 0:
+                sys.exit(98)
+        raise OSError("simulated export write failure")
+
+
+def failing_fdopen(fd, mode, *args, **kwargs):
+    return FailingWriter(real_fdopen(fd, mode, *args, **kwargs))
+
+
+os.fdopen = failing_fdopen
+
+sys.exit(flagctl.main())
+'''
+
+    def make_demo_db(self):
+        """固定样例库 demo.sqlite：dev/new_ui=false，qa/new_ui=true。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        return db
+
+    def write_wrapper(self, mode):
+        """在临时目录写入失败注入包装脚本并返回路径。"""
+        wrapper = os.path.join(self.tmpdir, "failing_export_" + mode + ".py")
+        with open(wrapper, "w", encoding="utf-8") as fh:
+            fh.write(self.WRAPPER_TEMPLATE.format(here=HERE))
+        return wrapper
+
+    def run_failing_export(self, wrapper, db, path, mode):
+        """在包装进程中执行 export dev dev.json，注入指定模式的写入失败。"""
+        env = dict(os.environ)
+        env["FLAGCTL_TEST_FAIL_MODE"] = mode
+        env["FLAGCTL_TEST_TARGET"] = path
+        return subprocess.run(
+            [sys.executable, wrapper, "--db", db, "export", "dev", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+    def check_write_failure_then_retry(self, mode):
+        """文件创建后写入失败 -> 清理残缺文件 -> 恢复正常后重试成功。"""
+        db = self.make_demo_db()
+        path = os.path.join(self.tmpdir, "dev.json")
+        self.assertFalse(os.path.exists(path))
+        # 临时目录内原有的其他文件：失败与重试都不得改动它。
+        sentinel = os.path.join(self.tmpdir, "keep.txt")
+        with open(sentinel, "wb") as fh:
+            fh.write(b"untouched\n")
+        wrapper = self.write_wrapper(mode)
+        with open(db, "rb") as fh:
+            db_bytes_before = fh.read()
+        rows_before = self.read_flags_rows(db)
+        listing_before = sorted(os.listdir(self.tmpdir))
+
+        proc = self.run_failing_export(wrapper, db, path, mode)
+
+        # 退出 2、stdout 为空、stderr 仅为 EXPORT_WRITE_ERROR 加换行；
+        # 若注入发生在文件创建之前（或未产生非空内容），包装进程会以
+        # 99/98 退出，下面的断言随之失败。
+        self.assertCommandError(proc, "EXPORT_WRITE_ERROR")
+        self.assertFalse(
+            os.path.exists(path), "写入失败后不得遗留本次新建的残缺文件"
+        )
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), db_bytes_before, "源库字节必须保持不变")
+        self.assertEqual(self.read_flags_rows(db), rows_before, "源库记录必须保持不变")
+        with open(sentinel, "rb") as fh:
+            self.assertEqual(fh.read(), b"untouched\n", "其他文件必须保持原样")
+        self.assertEqual(
+            sorted(os.listdir(self.tmpdir)),
+            listing_before,
+            "临时目录内不得新增或丢失其他文件",
+        )
+
+        # 恢复正常写入条件，立即用相同环境和输出路径重试导出。
+        retry = self.export_flags(db, "dev", path)
+        self.assertCommandOk(retry, '{"new_ui": false}')
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), "输出文件不得带 UTF-8 BOM")
+        self.assertEqual(raw, b'{"new_ui": false}\n')
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), db_bytes_before, "重试后源库字节必须保持不变")
+        self.assertEqual(self.read_flags_rows(db), rows_before, "重试后源库记录必须保持不变")
+
+    def test_write_error_before_any_content_removes_new_file(self):
+        # 文件已创建但尚未写入内容时发生 OSError。
+        self.check_write_failure_then_retry("empty")
+
+    def test_write_error_after_partial_content_removes_new_file(self):
+        # 已写入部分内容后发生 OSError。
+        self.check_write_failure_then_retry("partial")
 
 
 if __name__ == "__main__":
