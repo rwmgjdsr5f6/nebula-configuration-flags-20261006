@@ -8,7 +8,7 @@
     python flagctl.py --db <数据库文件> list <环境名>
     python flagctl.py --db <数据库文件> diff <环境名左> <环境名右>
     python flagctl.py --db <数据库文件> envs
-    python flagctl.py --db <数据库文件> import <环境名> <JSON 文件>
+    python flagctl.py --db <数据库文件> import <环境名> <JSON 文件> [--dry-run]
     python flagctl.py --db <数据库文件> export <环境名> <JSON 文件>
 
 仅使用 Python 3 标准库与 SQLite，不依赖网络或第三方包。
@@ -319,6 +319,53 @@ def cmd_import(db_path, env, file_path):
     return data
 
 
+def cmd_import_dry_run(db_path, env, file_path):
+    """只读预览导入：返回 {键名: {"before": 原值, "after": 导入值}}。
+
+    校验顺序与普通导入完全一致（环境名、读文件、JSON 解析、全部键名、
+    全部布尔值），全部通过后才读取存储。合法空对象直接返回 {}，不访问
+    数据库。预览只比较文件中出现的键与目标环境的直接设置：原值未设置
+    为 None（序列化为 null），布尔值保留 true/false，相同的键不输出；
+    文件未提及的键保持原样，不表示删除。
+
+    纯只读：不创建目录、数据库文件或 flags 表，不改动任何记录和输入
+    文件。存储分类复用 open_flag_store 的唯一一份规则，把“没有数据”
+    的信号（VALUE_NOT_SET：库文件缺失但父目录存在、有效库缺少 flags
+    表）连同目标环境无设置一起视为原值 None；父目录缺失、无效库、
+    所需列缺失或目标环境合法键的存储值不是严格文本 true/false 时报
+    STORAGE_ERROR。其他环境及未知键的记录不参与比较，其异常值也不
+    影响结果。
+    """
+    data = load_import_file(file_path)
+    if not data:
+        return {}
+    try:
+        with open_flag_store(db_path) as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM flags WHERE env = ?", (env,)
+            ).fetchall()
+    except FlagError as exc:
+        # 对预览而言，“没有任何已保存的值”意味着所有原值都是 null。
+        if exc.code == "VALUE_NOT_SET":
+            rows = []
+        else:
+            raise
+    stored = {}
+    for key, value in rows:
+        # 只关心文件中出现的目标环境已知键；未知键整行忽略，其异常值
+        # 不影响结果；已知键交给统一规则校验，非法即报 STORAGE_ERROR。
+        if key not in data:
+            continue
+        stored[key] = stored_bool_text(value) == "true"
+    result = {}
+    for key in sorted(data):
+        before = stored.get(key)
+        after = data[key]
+        if before != after:
+            result[key] = {"before": before, "after": after}
+    return result
+
+
 def cmd_export(db_path, env, file_path):
     """把一个环境已保存的直接设置导出为 JSON 文件，返回单行 JSON 文本。
 
@@ -433,6 +480,11 @@ def build_parser():
     p_import = sub.add_parser("import", help="从 JSON 文件导入环境的直接设置")
     p_import.add_argument("env")
     p_import.add_argument("file")
+    p_import.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只读预览导入变化，不写入存储",
+    )
 
     p_export = sub.add_parser("export", help="把环境的直接设置导出为 JSON 文件")
     p_export.add_argument("env")
@@ -466,10 +518,18 @@ def main(argv=None):
             elif args.command == "import":
                 # import 接收环境名和 JSON 文件路径：环境名校验先于读文件，
                 # 文件与内容校验先于访问数据库；输出仅含本次导入项的
-                # 单行 JSON 对象。
-                result = json.dumps(
-                    cmd_import(args.db, env, args.file), sort_keys=True
-                )
+                # 单行 JSON 对象。--dry-run 只读预览变化（before/after），
+                # 不写入存储，校验顺序与普通导入一致；预览输出为紧凑
+                # JSON，每项固定 before 在前、after 在后。
+                if args.dry_run:
+                    result = json.dumps(
+                        cmd_import_dry_run(args.db, env, args.file),
+                        separators=(",", ":"),
+                    )
+                else:
+                    result = json.dumps(
+                        cmd_import(args.db, env, args.file), sort_keys=True
+                    )
             elif args.command == "export":
                 # export 接收环境名和输出文件路径：环境名校验先于读取
                 # 配置，配置完整读取后才处理输出文件；stdout 与文件内容
