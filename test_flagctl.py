@@ -64,6 +64,16 @@
   相同报 EXPORT_WRITE_ERROR，输出已存在报 EXPORT_EXISTS 且原内容
   保留，输出父目录缺失报 EXPORT_WRITE_ERROR 且不创建目录；成功与
   失败路径下源库字节均保持不变。
+* export 在输出文件创建之后写入失败的文件保护：固定样例库
+  demo.sqlite（dev/new_ui=false、qa/new_ui=true）导出 dev 到
+  尚不存在的 dev.json，通过临时 runner 子进程在 os.fdopen 的
+  写入器上注入 OSError，分别覆盖文件已创建但尚未写入内容、以及
+  部分非空内容已落盘两种失败；两种情况均退出 2、stdout 为空、
+  stderr 仅为 EXPORT_WRITE_ERROR 加换行，调用结束后 dev.json
+  不残留，源库记录与字节、临时目录内既有文件均保持原样；恢复
+  正常写入条件后立即以相同环境与输出路径重试，退出 0、stderr
+  为空，stdout 与生成文件同为单行 {"new_ui": false} 加换行
+  （无 BOM 的 UTF-8），qa 设置与源库保持原样。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
 每个用例使用独立的临时目录，结束后自动清理，只依赖 Python 3 标准库。
@@ -2519,6 +2529,176 @@ class TestExport(FlagctlCliTestCase):
 
         with open(db, "rb") as fh:
             self.assertEqual(fh.read(), before)
+
+
+class TestExportWriteFailure(FlagctlCliTestCase):
+    """export 在输出文件创建之后写入失败的文件保护回归。
+
+    固定样例库 demo.sqlite 保存 dev/new_ui=false 与 qa/new_ui=true，
+    输出路径 dev.json 起初不存在。失败注入不依赖填满磁盘或修改系统
+    权限：用例把一段静态 runner 脚本写进临时目录，由子进程执行——
+    它与 ``python flagctl.py --db demo.sqlite export dev dev.json``
+    等价地调用 ``flagctl.main``，仅把 ``os.fdopen`` 换成一个替身
+    写入器，在 write 时注入 OSError（mode=empty 时不写任何内容，
+    mode=partial 时先让非空内容真正落盘再失败），并把失败瞬间的
+    文件现场记入 witness 文件供用例核对。两种场景都必须退出 2、
+    stdout 为空、stderr 仅为 ``EXPORT_WRITE_ERROR\\n``，调用结束后
+    dev.json 不残留，源库与临时目录内既有文件保持原样；随后恢复
+    正常写入条件立即重试，必须按正常导出协议成功。
+    """
+
+    EXPECTED_EXPORT = '{"new_ui": false}'
+    KEEP_CONTENT = b"pre-existing neighbor file\n"
+
+    RUNNER_SOURCE = '''\
+"""临时 runner：等价调用 flagctl export，并在写入时注入 OSError。
+
+参数：flagctl 目录、数据库路径、环境名、输出路径、失败模式
+（empty=创建后尚未写入即失败，partial=部分写入后失败）、
+witness 文件路径（记录失败瞬间的输出文件现场）。
+"""
+
+import json
+import os
+import sys
+
+
+def main():
+    flagctl_dir, db, env, out, mode, witness = sys.argv[1:7]
+    sys.path.insert(0, flagctl_dir)
+    import flagctl
+
+    class FailingWriter:
+        """os.fdopen 的替身：write 时注入 OSError。"""
+
+        def __init__(self, fd):
+            self.fd = fd
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            os.close(self.fd)
+            return False
+
+        def write(self, data):
+            # 此刻输出文件已被 os.open 排他创建：记录现场供用例核对。
+            record = {"existed": os.path.exists(out)}
+            if record["existed"]:
+                record["size_at_failure"] = os.path.getsize(out)
+            if mode == "partial":
+                # 先让非空内容真正落盘，再注入失败。
+                os.write(self.fd, data[:5])
+                record["size_after_partial"] = os.path.getsize(out)
+            with open(witness, "w", encoding="utf-8") as fh:
+                json.dump(record, fh)
+            raise OSError("simulated write failure")
+
+    os.fdopen = lambda fd, mode="r", *args, **kwargs: FailingWriter(fd)
+    return flagctl.main(["--db", db, "export", env, out])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+    def make_demo_db(self):
+        """固定样例库 demo.sqlite：dev/new_ui=false，qa/new_ui=true。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        return db
+
+    def write_tmp_file(self, name, content):
+        """在临时目录写入字节内容并返回路径。"""
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(content)
+        return path
+
+    def run_failing_export(self, runner, db, out, mode, witness):
+        """子进程执行 runner：等价导出 dev，写入时按 mode 注入 OSError。"""
+        return subprocess.run(
+            [sys.executable, runner, HERE, db, "dev", out, mode, witness],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def check_write_failure_then_retry(self, mode):
+        """注入写入失败 -> 核对清理与现场 -> 恢复正常条件立即重试。"""
+        db = self.make_demo_db()
+        out = os.path.join(self.tmpdir, "dev.json")
+        self.assertFalse(os.path.exists(out))
+        keep = self.write_tmp_file("keep.txt", self.KEEP_CONTENT)
+        runner = self.write_tmp_file(
+            "export_fail_runner.py", self.RUNNER_SOURCE.encode("utf-8")
+        )
+        witness = os.path.join(self.tmpdir, "witness.json")
+        rows_before = self.read_flags_rows(db)
+        self.assertEqual(
+            rows_before,
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+        with open(db, "rb") as fh:
+            db_bytes_before = fh.read()
+
+        proc = self.run_failing_export(runner, db, out, mode, witness)
+
+        # 输出协议：退出 2、stdout 为空、stderr 仅 EXPORT_WRITE_ERROR 加换行。
+        self.assertCommandError(proc, "EXPORT_WRITE_ERROR")
+        # 文件保护：不遗留本次新建的残缺文件。
+        self.assertFalse(
+            os.path.exists(out), "写入失败后不得遗留残缺的 dev.json"
+        )
+        # 异常确实发生在文件创建之后（而非创建之前的失败）。
+        with open(witness, "r", encoding="utf-8") as fh:
+            record = json.load(fh)
+        self.assertTrue(
+            record["existed"], "注入失败时输出文件必须已被创建: %r" % record
+        )
+        self.assertEqual(
+            record["size_at_failure"], 0, "失败前不得已有内容写入: %r" % record
+        )
+        if mode == "partial":
+            # 部分写入场景确实产生过非空内容。
+            self.assertGreater(
+                record["size_after_partial"], 0,
+                "部分写入场景必须有非空内容落盘: %r" % record,
+            )
+        # 源库全部记录与文件字节保持原样，既有其他文件不受影响。
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), db_bytes_before, "源库字节必须保持不变")
+        with open(keep, "rb") as fh:
+            self.assertEqual(fh.read(), self.KEEP_CONTENT, "既有文件必须保持原样")
+
+        # 恢复正常写入条件后，立即用相同环境和输出路径重试。
+        retry = self.export_flags(db, "dev", out)
+        self.assertEqual(
+            retry.returncode, 0, "重试应退出 0，实际 stderr: %r" % retry.stderr
+        )
+        self.assertEqual(retry.stderr, "")
+        self.assertEqual(retry.stdout, self.EXPECTED_EXPORT + "\n")
+        with open(out, "rb") as fh:
+            raw = fh.read()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), "输出文件不得带 UTF-8 BOM")
+        self.assertEqual(raw, (self.EXPECTED_EXPORT + "\n").encode("utf-8"))
+        # qa 设置与源库整体保持原样。
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), db_bytes_before, "重试后源库字节必须保持不变")
+        with open(keep, "rb") as fh:
+            self.assertEqual(fh.read(), self.KEEP_CONTENT)
+
+    def test_write_fails_before_any_content_written(self):
+        # 输出文件已创建但尚未写入内容时发生 OSError。
+        self.check_write_failure_then_retry("empty")
+
+    def test_write_fails_after_partial_content_written(self):
+        # 部分非空内容写入后发生 OSError。
+        self.check_write_failure_then_retry("partial")
 
 
 if __name__ == "__main__":
