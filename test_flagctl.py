@@ -43,8 +43,12 @@
   不输出部分差异，且调用前后目录、文件字节、表结构与记录保持不变。
 * import 从 JSON 文件导入一个环境的直接设置：固定样例
   dev/new_ui=true、qa/new_ui=true 导入 {"new_ui": false} 后 dev
-  变为 false、qa 保持 true；空对象 {} 不访问数据库；非空导入在
-  全新路径上创建数据库文件和 flags 表；环境名 -> 读文件 -> JSON
+  变为 false、qa 保持 true；空对象 {} 不访问数据库——父目录与其中
+  flags.sqlite 均缺失时仍输出 {} 且不创建目录或文件，目标为内容是
+  固定文本 "local demo" 的 broken.sqlite（非 SQLite 库）时仍输出
+  {} 且文件字节不变，这两种路径上改用 {"new_ui": false} 导入均报
+  STORAGE_ERROR 且目录与文件状态保持调用前不变；非空导入在全新
+  路径上创建数据库文件和 flags 表；环境名 -> 读文件 -> JSON
   解析 -> 键名 -> 布尔值的校验顺序（EMPTY_ENV / IMPORT_READ_ERROR
   / INVALID_JSON / UNKNOWN_KEY / INVALID_BOOL），校验失败不创建
   库或表、不改动记录；父目录不存在、普通文本文件、flags 表缺列
@@ -1845,6 +1849,93 @@ class TestImport(FlagctlCliTestCase):
         self.assertImportOk(self.import_flags(db, "dev", path), {})
 
         self.assertFalse(os.path.exists(db), "空对象导入不得创建数据库文件: %s" % db)
+
+    def test_empty_object_on_missing_parent_succeeds_and_nonempty_errors(self):
+        # 第一组固定样例（missing 目录及其中的 flags.sqlite 都不存在）：
+        # import dev empty.json 退出 0、stdout 严格为 {} 加换行、
+        # stderr 为空，目录与数据库文件仍不存在；同一库路径改用
+        # nonempty.json（{"new_ui": false}）导入则退出 2、stdout 为空、
+        # stderr 严格为 STORAGE_ERROR 加换行，目录与文件状态保持不变。
+        missing_dir = os.path.join(self.tmpdir, "import_empty_missing_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        empty_path = self.write_import_file("{}", name="empty.json")
+        nonempty_path = self.write_import_file(
+            '{"new_ui":false}', name="nonempty.json"
+        )
+        with open(empty_path, "rb") as fh:
+            self.assertEqual(fh.read(), b"{}")
+        with open(nonempty_path, "rb") as fh:
+            self.assertEqual(fh.read(), b'{"new_ui":false}')
+        self.assertFalse(os.path.exists(missing_dir))
+        self.assertFalse(os.path.exists(db))
+
+        ok = self.import_flags(db, "dev", empty_path)
+        self.assertEqual(
+            ok.returncode, 0, "空对象导入期望退出码 0，实际 stderr: %r" % ok.stderr
+        )
+        self.assertEqual(ok.stdout, "{}\n")
+        self.assertEqual(ok.stderr, "")
+
+        self.assertFalse(
+            os.path.exists(missing_dir),
+            "空对象导入不得创建缺失的父目录: %s" % missing_dir,
+        )
+        self.assertFalse(
+            os.path.exists(db), "空对象导入不得创建数据库文件: %s" % db
+        )
+
+        bad = self.import_flags(db, "dev", nonempty_path)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stdout, "")
+        self.assertEqual(bad.stderr, "STORAGE_ERROR\n")
+
+        self.assertFalse(
+            os.path.exists(missing_dir),
+            "失败导入不得创建缺失的父目录: %s" % missing_dir,
+        )
+        self.assertFalse(os.path.exists(db), "失败导入不得创建数据库文件: %s" % db)
+
+    def test_empty_object_on_plain_text_db_succeeds_and_nonempty_errors(self):
+        # 第二组固定样例（broken.sqlite 已存在，内容是固定文本
+        # "local demo"，不是 SQLite 数据库）：import dev empty.json
+        # 退出 0、stdout 严格为 {} 加换行、stderr 为空，文本文件的
+        # 字节完全不变；同一库路径改用 nonempty.json（{"new_ui":
+        # false}）导入则退出 2、stdout 为空、stderr 严格为
+        # STORAGE_ERROR 加换行，文本文件的字节仍与调用前完全一致。
+        db = self.db_path("broken")
+        original = b"local demo"
+        with open(db, "wb") as fh:
+            fh.write(original)
+        empty_path = self.write_import_file("{}", name="empty.json")
+        nonempty_path = self.write_import_file(
+            '{"new_ui":false}', name="nonempty.json"
+        )
+        with open(empty_path, "rb") as fh:
+            self.assertEqual(fh.read(), b"{}")
+        with open(nonempty_path, "rb") as fh:
+            self.assertEqual(fh.read(), b'{"new_ui":false}')
+
+        ok = self.import_flags(db, "dev", empty_path)
+        self.assertEqual(
+            ok.returncode, 0, "空对象导入期望退出码 0，实际 stderr: %r" % ok.stderr
+        )
+        self.assertEqual(ok.stdout, "{}\n")
+        self.assertEqual(ok.stderr, "")
+
+        with open(db, "rb") as fh:
+            self.assertEqual(
+                fh.read(), original, "空对象导入不得改写非 SQLite 文件: %s" % db
+            )
+
+        bad = self.import_flags(db, "dev", nonempty_path)
+        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.stdout, "")
+        self.assertEqual(bad.stderr, "STORAGE_ERROR\n")
+
+        with open(db, "rb") as fh:
+            self.assertEqual(
+                fh.read(), original, "失败导入不得改写非 SQLite 文件: %s" % db
+            )
 
     def test_empty_env_rejected_before_reading_file(self):
         # 空或全空白环境名先报 EMPTY_ENV：即使文件不存在也不报
