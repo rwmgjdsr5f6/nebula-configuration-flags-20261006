@@ -178,6 +178,23 @@
   环境与输出路径立即重试，退出 0、stderr 为空，stdout 与生成文件
   同为单行 {"new_ui": false} 加换行（无 BOM 的 UTF-8），qa 仍为
   true，源库保持原样。
+* export 写入失败后“清理本身也失败”的边界：固定样例库 demo.sqlite
+  （dev/new_ui=false、qa/new_ui=true）与内容固定的 keep.txt 同处
+  独立临时目录，dev.json 起初不存在；按公开入口
+  python flagctl.py --db demo.sqlite export dev dev.json 调用，经仅对
+  本次调用生效的 sitecustomize（PYTHONPATH 注入，命令行不变）稳定制造
+  输出文件排他创建成功、正常导出文本的前五个 UTF-8 字节已真实写入并
+  落盘后 write 抛 OSError、随后 os.remove 删除这个新建文件再次抛
+  OSError 的条件；注入点自查并记录两次失败的先后顺序，不允许用创建
+  之前的失败代替。该调用退出 2、stdout 为空、stderr 仅为
+  EXPORT_WRITE_ERROR 加换行（不含异常消息或堆栈），dev.json 仍存在且
+  字节恰为已写入的五个字节，源库字节与全部记录、keep.txt 保持原样，
+  dev 的 false 不被当成未设置、qa/new_ui=true 不受影响。同一用例内
+  解除全部故障条件后以同一环境、同一输出路径再正常调用一次 export：
+  残留文件已经存在，退出 2、stdout 为空、stderr 仅为 EXPORT_EXISTS
+  加换行，残留字节、源库与 keep.txt 均不变。故障条件只作用于本用例的
+  目标输出，不影响样例准备或其他测试，不依赖真实磁盘耗尽、权限变化或
+  网络，重复执行结果一致。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
 每个用例使用独立的临时目录，结束后自动清理，只依赖 Python 3 标准库。
@@ -4817,6 +4834,207 @@ sys.exit(flagctl.main())
     def test_write_error_after_partial_content_removes_new_file(self):
         # 已写入部分内容后发生 OSError。
         self.check_write_failure_then_retry("partial")
+
+
+class TestExportWriteFailureCleanupAlsoFails(FlagctlCliTestCase):
+    """export 写入失败、随后清理残缺文件本身也失败时的错误协议回归。
+
+    覆盖 export-flow.txt 第七节说明的边界：os.open 排他创建成功之后
+    write 抛 OSError，cmd_export 用 contextlib.suppress(OSError) 包裹
+    os.remove 清理本次新建的文件；若删除本身再抛 OSError，该异常被
+    显式忽略，对外错误码仍是 EXPORT_WRITE_ERROR，不保证残缺文件消失。
+
+    固定样例：demo.sqlite 保存 dev/new_ui=false 与 qa/new_ui=true（均为
+    严格文本），dev.json 起初不存在，同目录另有内容固定的 keep.txt。
+    两次调用都严格按公开入口
+    ``python flagctl.py --db demo.sqlite export dev dev.json`` 执行：
+
+    * 第一次调用经仅对该子进程生效的 sitecustomize（PYTHONPATH 注入，
+      命令行本身与公开入口逐字一致）稳定制造：输出文件排他创建成功、
+      正常导出文本的前五个 UTF-8 字节已真实写入并落盘后 write 抛
+      OSError，随后 os.remove 删除这个新建文件再次抛 OSError。注入点
+      把两次失败按发生顺序写入事件日志，并自查失败确实发生在文件创建
+      之后、落盘内容恰为五个字节，否则以 99/98 退出使用例明确失败，
+      不允许用创建文件之前的失败代替。预期退出 2、stdout 为空、stderr
+      仅为 EXPORT_WRITE_ERROR 加换行（不含异常消息或堆栈）；dev.json
+      仍存在且字节恰为已写入的五个字节；源库字节与全部记录不变，dev
+      的 false 不被当成未设置，qa/new_ui=true 不受影响，keep.txt 原样。
+    * 同一用例内解除全部故障条件（第二次调用是不带注入环境变量的普通
+      子进程），以同一环境、同一输出路径再正常调用一次 export：残留
+      文件已经存在，退出 2、stdout 为空、stderr 仅为 EXPORT_EXISTS 加
+      换行，残留字节不变，源库与 keep.txt 仍保持原样。
+
+    故障条件只作用于第一次调用的子进程且只针对目标输出路径：样例准备
+    走不经注入的独立子进程，被替换的 os.remove 对其他路径仍正常删除；
+    不依赖真实磁盘耗尽、操作系统权限变化或网络。注入目录、事件日志与
+    样例全部位于本用例独享的临时目录，结束即随夹具清理；父进程环境不
+    被修改，重复执行结果一致。
+    """
+
+    # 注入脚本：作为子进程启动期自动导入的 sitecustomize 运行，仅依赖
+    # 标准库。它把 os.fdopen 换成“先真实写入并落盘前五个字节再抛
+    # OSError”的包装，把 os.remove 换成“仅对目标输出路径抛 OSError”
+    # 的版本；两次失败各自向事件日志追加一行以证明先后顺序。所有动态
+    # 信息都经环境变量传入，脚本本身不含占位符。
+    SITECUSTOMIZE = '''import os
+import sys
+
+_target = os.path.abspath(os.environ["FLAGCTL_TEST_TARGET"])
+_log = os.environ["FLAGCTL_TEST_LOG"]
+_real_fdopen = os.fdopen
+_real_remove = os.remove
+
+
+def _record(name):
+    with open(_log, "a", encoding="utf-8") as fh:
+        fh.write(name + "\\n")
+
+
+class _PartialWriteThenFail(object):
+    def __init__(self, fh):
+        self._fh = fh
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._fh.close()
+        return False
+
+    def write(self, data):
+        # 自查：失败必须发生在目标文件排他创建成功之后，否则以 99 退出。
+        if not os.path.isfile(_target):
+            sys.exit(99)
+        # 先把正常导出文本的前五个字节真实写入并落盘。
+        self._fh.write(data[:5])
+        self._fh.flush()
+        # 自查：落盘内容必须恰为五个字节，否则以 98 退出。
+        if os.path.getsize(_target) != 5:
+            sys.exit(98)
+        _record("write_error")
+        raise OSError("simulated export write failure")
+
+
+def _fdopen_fails_after_partial_write(fd, *args, **kwargs):
+    return _PartialWriteThenFail(_real_fdopen(fd, *args, **kwargs))
+
+
+def _remove_fails_for_target(path, *args, **kwargs):
+    # 仅清理目标输出文件时失败；其他路径的删除照常进行。
+    if os.path.abspath(os.fspath(path)) == _target:
+        _record("remove_error")
+        raise OSError("simulated cleanup failure")
+    return _real_remove(path, *args, **kwargs)
+
+
+os.fdopen = _fdopen_fails_after_partial_write
+os.remove = _remove_fails_for_target
+'''
+
+    def make_demo_db(self):
+        """固定样例库 demo.sqlite：dev/new_ui=false，qa/new_ui=true。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        return db
+
+    def install_sitecustomize(self):
+        """在临时目录写入注入用 sitecustomize.py，返回加入 PYTHONPATH 的目录。"""
+        inject_dir = os.path.join(self.tmpdir, "inject")
+        os.makedirs(inject_dir, exist_ok=True)
+        with open(
+            os.path.join(inject_dir, "sitecustomize.py"), "w", encoding="utf-8"
+        ) as fh:
+            fh.write(self.SITECUSTOMIZE)
+        return inject_dir
+
+    def run_faulty_export(self, inject_dir, db, out_path, events_log):
+        """以与公开入口逐字一致的命令行执行 export，仅经环境变量注入故障。"""
+        env = dict(os.environ)
+        env["PYTHONPATH"] = inject_dir + os.pathsep + env.get("PYTHONPATH", "")
+        env["FLAGCTL_TEST_TARGET"] = out_path
+        env["FLAGCTL_TEST_LOG"] = events_log
+        return subprocess.run(
+            [sys.executable, FLAGCTL, "--db", db, "export", "dev", out_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+    def test_write_error_then_cleanup_error_then_export_exists(self):
+        db = self.make_demo_db()
+        out_path = os.path.join(self.tmpdir, "dev.json")
+        keep = os.path.join(self.tmpdir, "keep.txt")
+        events_log = os.path.join(self.tmpdir, "fault-events.log")
+        with open(keep, "wb") as fh:
+            fh.write(b"fixed keep content\n")
+        self.assertFalse(os.path.exists(out_path), "dev.json 起初必须不存在")
+        self.assertFalse(os.path.exists(events_log))
+
+        with open(db, "rb") as fh:
+            db_bytes_before = fh.read()
+        rows_before = self.read_flags_rows(db)
+        self.assertEqual(
+            rows_before,
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+        keep_bytes_before = self.read_file_bytes(keep)
+        # 正常导出文本（单行 JSON 加换行）的前五个 UTF-8 字节，即 {"new。
+        expected_partial = ('{"new_ui": false}' + "\n").encode("utf-8")[:5]
+        self.assertEqual(expected_partial, b'{"new')
+
+        # 调用一：文件创建成功、前五个字节落盘后写入 OSError，清理再次 OSError。
+        inject_dir = self.install_sitecustomize()
+        proc = self.run_faulty_export(inject_dir, db, out_path, events_log)
+
+        # 退出 2、stdout 为空、stderr 严格为 EXPORT_WRITE_ERROR 加换行。
+        # 若注入发生在文件创建之前或落盘不是五个字节，包装进程会以
+        # 99/98 退出，下面的断言随之明确失败。
+        self.assertCommandError(proc, "EXPORT_WRITE_ERROR")
+        self.assertNotIn("Traceback", proc.stderr, "stderr 不得包含堆栈")
+        self.assertNotIn(
+            "simulated", proc.stderr, "stderr 不得包含底层异常消息"
+        )
+
+        # 两次失败必须确实依次发生且各恰好一次：先写入失败，再清理失败。
+        with open(events_log, "r", encoding="utf-8") as fh:
+            event_rows = [line for line in fh.read().splitlines() if line]
+        self.assertEqual(
+            event_rows,
+            ["write_error", "remove_error"],
+            "必须先发生写入失败、再发生清理失败，且各恰好一次",
+        )
+
+        # 清理失败：残缺文件仍存在，字节恰为已写入的五个字节。
+        self.assertTrue(os.path.exists(out_path), "清理失败后残缺文件必须仍存在")
+        partial_bytes = self.read_file_bytes(out_path)
+        self.assertEqual(partial_bytes, expected_partial)
+        self.assertEqual(len(partial_bytes), 5)
+
+        # 源库字节、全部记录不变；dev 的 false 是实际设置而非未设置，
+        # qa/new_ui=true 不受影响；keep.txt 原样。
+        self.assertEqual(self.read_file_bytes(db), db_bytes_before)
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+        self.assertEqual(self.read_file_bytes(keep), keep_bytes_before)
+
+        # 调用二：解除全部故障条件，以同一环境、同一路径正常再导出一次。
+        # 残留文件已存在，必须报 EXPORT_EXISTS 且不改动它。
+        retry = self.export_flags(db, "dev", out_path)
+        self.assertCommandError(retry, "EXPORT_EXISTS")
+        self.assertNotIn("Traceback", retry.stderr)
+        self.assertEqual(
+            self.read_file_bytes(out_path),
+            partial_bytes,
+            "EXPORT_EXISTS 不得改动残留文件",
+        )
+        self.assertEqual(self.read_file_bytes(db), db_bytes_before)
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+        self.assertEqual(self.read_file_bytes(keep), keep_bytes_before)
 
 
 if __name__ == "__main__":
