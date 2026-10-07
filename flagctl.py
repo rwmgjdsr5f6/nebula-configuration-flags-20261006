@@ -222,13 +222,24 @@ def _unique_object_pairs(pairs):
     return result
 
 
+def _reject_constant(value):
+    """json.loads 的 parse_constant：拒绝非标准常量 NaN/Infinity/-Infinity。
+
+    Python 的 json 解析器默认接受这些 JS 风格的未加引号常量（返回
+    float），但它们不属于合法 JSON；这里统一按语法错误处理，由
+    load_import_file 归类为 INVALID_JSON。
+    """
+    raise ValueError("non-standard JSON constant: %s" % value)
+
+
 def load_import_file(file_path):
     """读取并校验导入文件，返回 {键名: 布尔值}。
 
     校验全部在访问数据库之前完成，失败时不触碰任何存储：
 
     * 文件不存在或无法读取 -> IMPORT_READ_ERROR；
-    * 非法 UTF-8、JSON 语法错误、顶层不是对象、存在重复键 -> INVALID_JSON；
+    * 非法 UTF-8、JSON 语法错误（含未加引号的 NaN/Infinity/
+      -Infinity）、顶层不是对象、存在重复键 -> INVALID_JSON；
     * 先校验全部键名，未知键 -> UNKNOWN_KEY；
     * 再校验全部值，非 JSON 布尔值 -> INVALID_BOOL。
     """
@@ -242,7 +253,11 @@ def load_import_file(file_path):
     except UnicodeDecodeError:
         raise FlagError("INVALID_JSON")
     try:
-        data = json.loads(text, object_pairs_hook=_unique_object_pairs)
+        data = json.loads(
+            text,
+            object_pairs_hook=_unique_object_pairs,
+            parse_constant=_reject_constant,
+        )
     except FlagError:
         raise
     except ValueError:

@@ -127,7 +127,9 @@ stderr 均为空。
   或 import 文件中的值不是 JSON 布尔值（如 `"false"`、`1`、`null`）。
 - **IMPORT_READ_ERROR**：import 的文件不存在或无法读取。
 - **INVALID_JSON**：import 的文件不是合法 UTF-8、JSON 语法错误、
-  顶层不是对象或存在重复键。
+  顶层不是对象或存在重复键。未加引号的 `NaN`、`Infinity`、
+  `-Infinity` 不是合法 JSON 词法（出现在任意嵌套位置都算语法错误，
+  先于键名与布尔值校验）；引号内的同名文本只是普通字符串。
 - **VALUE_NOT_SET**：get 或 unset 的目标 (环境, 键) 没有已保存的
   记录。父目录存在但数据库文件缺失、或文件是有效 SQLite 库但缺少
   flags 表时，也按此处理——查询不会顺手补建文件或表。

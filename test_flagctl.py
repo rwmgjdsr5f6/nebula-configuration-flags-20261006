@@ -1876,6 +1876,76 @@ class TestImport(FlagctlCliTestCase):
                     os.path.exists(db), "校验失败不得创建数据库: %s" % db
                 )
 
+    def test_bare_constants_reported_as_invalid_json(self):
+        # 未加引号的 NaN/Infinity/-Infinity 不是合法 JSON：无论出现在
+        # 顶层、对象值还是嵌套结构中，都在键名及布尔值校验之前报
+        # INVALID_JSON（即使外层是未知键，也不得报 UNKNOWN_KEY）。
+        contents = [
+            '{"new_ui": NaN}',
+            '{"new_ui": Infinity}',
+            '{"new_ui": -Infinity}',
+            '{"other_key": [NaN]}',
+            '{"other_key": [Infinity]}',
+            '{"new_ui": {"a": -Infinity}}',
+            '{"new_ui": [[[{"x": [NaN]}]]]}',
+            'NaN',
+            'Infinity',
+            '-Infinity',
+            '[NaN]',
+            '{"new_ui": true, "new_ui": NaN}',
+        ]
+        for index, content in enumerate(contents):
+            with self.subTest(content=content):
+                db = self.db_path("import_constant_%d" % index)
+                path = self.write_import_file(
+                    content, name="constant_%d.json" % index
+                )
+
+                self.assertCommandError(
+                    self.import_flags(db, "dev", path), "INVALID_JSON"
+                )
+
+                self.assertFalse(
+                    os.path.exists(db), "校验失败不得创建数据库: %s" % db
+                )
+
+    def test_bare_constant_rejected_and_values_unchanged(self):
+        # 固定验收样例：{"new_ui": NaN} 报 INVALID_JSON，既有值保持
+        # true，其他环境的记录也不受影响。
+        db = self.db_path("import_constant_keep")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        path = self.write_import_file('{"new_ui": NaN}')
+
+        self.assertCommandError(self.import_flags(db, "dev", path), "INVALID_JSON")
+
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+    def test_quoted_constants_and_large_exponents_not_syntax_errors(self):
+        # 引号内的 NaN/Infinity 只是普通字符串，按值校验报 INVALID_BOOL；
+        # 键名是 NaN 仍报 UNKNOWN_KEY；合法数字（含 1e999 溢出为
+        # Infinity）属于合法 JSON 词法，作为开关值报 INVALID_BOOL。
+        cases = [
+            ('{"new_ui": "NaN"}', "INVALID_BOOL"),
+            ('{"new_ui": "Infinity"}', "INVALID_BOOL"),
+            ('{"new_ui": "-Infinity"}', "INVALID_BOOL"),
+            ('{"NaN": true}', "UNKNOWN_KEY"),
+            ('{"new_ui": 1e999}', "INVALID_BOOL"),
+        ]
+        for index, (content, code) in enumerate(cases):
+            with self.subTest(content=content):
+                db = self.db_path("import_constant_quote_%d" % index)
+                path = self.write_import_file(
+                    content, name="constant_quote_%d.json" % index
+                )
+
+                self.assertCommandError(self.import_flags(db, "dev", path), code)
+
+                self.assertFalse(
+                    os.path.exists(db), "校验失败不得创建数据库: %s" % db
+                )
+
     def test_missing_parent_directory_reports_storage_error(self):
         # 非空导入遇到父目录不存在：报 STORAGE_ERROR，不创建目录或文件。
         missing_dir = os.path.join(self.tmpdir, "import_no_such_dir")
