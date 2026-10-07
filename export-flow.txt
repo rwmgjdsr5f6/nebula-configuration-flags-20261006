@@ -1,0 +1,305 @@
+flagctl export 导出流程说明
+==========================
+
+本文说明 `python flagctl.py --db <库文件> export <环境名> <JSON 文件>`
+一次导出调用内部各环节的先后关系与失败判定。export 是只读源库、新建
+输出文件的命令：环境名处理、配置读取、输出路径检查、文件写入四个环节
+严格按固定顺序进行，前一环节不通过就不会进入下一环节。本文只描述现有
+行为，关键结论均注明 flagctl.py 中的现有函数名与分支条件，可直接与源码
+核对；不新增命令、不改变任何公开行为，既有的命令、错误码、SQLite 表
+结构与文档均保持不变。
+
+文中样例结果均为“根据源码推导的预期”，本文不声称样例已经实际执行。
+
+一、整体流程概览
+----------------
+
+export 分支在 main() 中只做三件事：normalize_env() 去空白、
+validate_env() 校验非空，然后调用 cmd_export()。cmd_export() 内部按
+以下顺序执行，任一环节抛 FlagError 都由 main() 统一处理：stderr 仅
+输出错误码加换行，退出码 2，stdout 为空：
+
+  1. 环境名处理（main() 中的 normalize_env / validate_env）
+  2. 完整读取目标环境配置（cmd_export 调用 cmd_list；后者经
+     open_flag_store 访问存储、用 stored_bool_text 校验值），并把结果
+     序列化为单行 JSON 文本
+  3. 输出路径检查：先比对输出路径与库路径，再检查输出文件是否已存在
+  4. 排他创建输出文件并写入（os.open 的 O_EXCL 分支 + os.fdopen
+     写入 UTF-8 字节）；成功后 cmd_export 返回 JSON 文本，main() 把
+     同一份文本加换行写入 stdout
+
+顺序的关键后果：第 2 步（读配置）整体先于第 3、4 步（碰输出文件）。
+因此存储异常一定先于输出文件相关错误被报告，输出文件是否已存在此时
+根本不会被检查（详见第六节）。
+
+二、第一步：环境名处理 —— EMPTY_ENV
+------------------------------------
+
+main() 的 export 分支与 list/set/get 等接收环境名的命令走同一条路径：
+
+    env = normalize_env(args.env)   # env.strip()：去两端空白，
+                                    # 内部空白原样保留，大小写敏感
+    validate_env(env)               # 去空白后为空串 -> EMPTY_ENV
+
+normalize_env() 只做 strip；" dev " 与 "dev" 导出同一个环境，"Dev" 与
+"dev" 则是两个不同环境，后续 SQL 按去空白后的文本精确匹配。
+validate_env() 在 env 为空串时抛 FlagError("EMPTY_ENV")。
+
+这一步发生在 cmd_export() 之前，即环境名为空（含全空白）时既不读取
+数据库，也不检查或创建输出文件。
+
+三、第二步：完整读取配置（cmd_export -> cmd_list）
+--------------------------------------------------
+
+cmd_export() 的第一条实际语句是：
+
+    data = cmd_list(db_path, env)
+    text = json.dumps(data, sort_keys=True)
+
+也就是说，导出对象直接复用 list 的读取结果与全部规则，规则只维护这
+一份：
+
+1. 读取范围：只读目标环境的合法键
+
+   cmd_list() 执行 `SELECT key, value FROM flags WHERE env = ?`，
+   只取回目标环境的行；遍历时对 `key not in KNOWN_KEYS` 的行直接
+   continue 跳过。当前 KNOWN_KEYS 只有 "new_ui"。由此：
+
+   * 导出对象仅含目标环境已保存的合法键；
+   * false 是实际布尔设置：行值为严格文本 "false" 时，
+     stored_bool_text() 原样通过，cmd_list() 以
+     `stored_bool_text(value) == "true"` 映射为 JSON 布尔 false，
+     与 true 一样出现在结果中；
+   * 未设置的键（该环境无对应行）不出现，不补默认值或继承值；
+   * 未知键的行整行忽略，即使其值异常也不影响结果；
+   * 其他环境的行不在 SELECT 范围内，其值合法与否都不影响本次导出。
+
+2. 存储状态分类（open_flag_store()，只读命令共用的唯一一份规则）
+
+   cmd_list() 在 open_flag_store() 上下文里执行查询，并把
+   VALUE_NOT_SET 翻译为空结果，其余 STORAGE_ERROR 原样上抛：
+
+   * 库文件不存在（os.path.exists 为假）：
+     - 父目录不存在（os.path.isdir(parent) 为假）->
+       FlagError("STORAGE_ERROR")；
+     - 父目录存在 -> FlagError("VALUE_NOT_SET")，cmd_list() 将其
+       翻译为 {}；
+   * 库文件存在：connect() 连接失败 -> STORAGE_ERROR；查询时
+     sqlite3.OperationalError 且信息含 "no such table"（有效库缺
+     flags 表）-> VALUE_NOT_SET，cmd_list() 翻译为 {}；其余
+     sqlite3.Error（含目标文件不是有效 SQLite 库、flags 表缺少
+     key/value 等所需列）-> STORAGE_ERROR；
+   * 目标环境合法键的存储值不是严格文本 "true"/"false"：
+     stored_bool_text() 抛 FlagError("STORAGE_ERROR")。不修剪空白、
+     不转换大小写，也不接受 "1"、"yes" 等写法。
+
+3. 三种“没有数据”的情况导出 {}，且不补建源库
+
+   库文件缺失但父目录存在、有效库缺 flags 表、目标环境无任何合法
+   设置，cmd_list() 都返回 {}，cmd_export() 据此得到 text = "{}"，
+   导出照常成功：stdout 与文件内容均为 `{}` 加换行。整个过程只做
+   SELECT，不创建目录、库文件或 flags 表，也不修复异常值。
+
+四、第三步：输出路径检查
+------------------------
+
+配置读取（含 json.dumps 序列化）全部成功后，cmd_export() 才依次检查
+输出路径，两个分支有固定先后：
+
+  1. 输出路径与库路径相同 -> EXPORT_WRITE_ERROR
+
+       if os.path.normcase(os.path.abspath(file_path)) == \
+          os.path.normcase(os.path.abspath(db_path)):
+           raise FlagError("EXPORT_WRITE_ERROR")
+
+     比较的是两侧各自 abspath 后再 normcase 的结果（规范化绝对路径；
+     不解析符号链接）。注意该比较先于下面的 exists 检查：输出路径同时
+     “等于库路径”且“文件已存在”时，报的是 EXPORT_WRITE_ERROR 而不是
+     EXPORT_EXISTS。此时不打开任何文件，源库自然保持原样。
+
+  2. 其他已存在的输出路径 -> EXPORT_EXISTS
+
+       if os.path.exists(file_path):
+           raise FlagError("EXPORT_EXISTS")
+
+     只要规范化绝对路径不等于库路径，输出路径已存在即报
+     EXPORT_EXISTS，原内容保留：不会打开、截断或覆盖该文件。
+
+五、第四步：排他创建、写入与成功输出
+------------------------------------
+
+通过上述检查后才创建文件：
+
+    fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+
+* os.open 抛出 FileExistsError（exists 检查与创建之间的竞态，文件被
+  其他进程抢先创建）：按与 exists 分支相同的规则报 EXPORT_EXISTS；
+* os.open 抛出其他 OSError（典型为输出父目录缺失，也包括无权限、
+  路径是目录等）：报 EXPORT_WRITE_ERROR，且不创建目录；
+* 创建成功后用 os.fdopen(fd, "wb") 写入
+  `(text + "\n").encode("utf-8")`：普通 UTF-8 编码不产生 BOM，内容
+  是单行 JSON 对象加换行。json.dumps 带 sort_keys=True，键按名排序、
+  冒号与逗号后带空格（单键时即 `{"new_ui": false}`）。
+
+写入成功后 cmd_export() 返回不含换行的 text；main() 对 export 与其他
+成功命令统一执行 `sys.stdout.write(result + "\n")`。因此 stdout 的
+一行与文件中的字节内容完全相同，均为同一份单行 JSON 加换行，文件为
+无 BOM 的 UTF-8。
+
+六、为什么输出文件已存在时仍可能先得到存储错误
+----------------------------------------------
+
+这是“先完整读取配置、后处理输出文件”顺序的直接后果。cmd_export()
+在调用任何 os.path 检查之前，先执行 `data = cmd_list(db_path, env)`；
+而 cmd_list() 对父目录缺失、无效数据库、所需列缺失、目标环境合法键
+存储值非法等情况一律抛 STORAGE_ERROR（见第三节）。该异常沿
+cmd_export() 直接向上传播到 main()，函数根本不会执行到后面的
+abspath 比较与 os.path.exists 分支。
+
+因此：
+
+* 目标环境合法键存有非法值时，即使输出文件已经存在，报错仍是
+  STORAGE_ERROR，而不是 EXPORT_EXISTS；输出文件既不会被读取也不会
+  被改动；
+* 反之，只有配置读取完全成功（包括数据为空而导出 {} 的情形），输出
+  路径相关的 EXPORT_WRITE_ERROR / EXPORT_EXISTS 才有机会被报告。
+
+存储错误与输出文件错误不会同时出现，也不存在“先发现文件已存在就不
+查库”的反向顺序。
+
+七、写入失败时的清理边界
+------------------------
+
+文件已由 os.open 排他创建成功、但随后的 fdopen 包装或 write 抛出
+OSError（写入中途失败）时，cmd_export() 的处理是：
+
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.remove(file_path)
+        raise FlagError("EXPORT_WRITE_ERROR")
+
+即：写入失败会尝试删除本次调用新建的残缺文件，然后报
+EXPORT_WRITE_ERROR。需要注意的边界是：os.remove() 自身若再抛
+OSError（例如权限变化、文件已被移走），该异常被
+contextlib.suppress(OSError) 显式忽略，对外的错误码仍是
+EXPORT_WRITE_ERROR，源码不保证残缺文件一定被删除。此点仅作行为说明：
+清理是“尽力而为”，错误码不因清理失败而改变。
+
+若是输出文件在调用前就已存在，流程在第三、四步即报 EXPORT_EXISTS，
+不会进入这段删除逻辑，原有文件必然保持原样。
+
+八、固定样例（源码推导的预期）
+------------------------------
+
+固定前提：
+
+* 数据库文件的父目录（当前工作目录）已存在；
+* demo.sqlite 是有效 SQLite 库，含结构如下的 flags 表（表结构不变）：
+
+      CREATE TABLE flags (
+          env   TEXT NOT NULL,
+          key   TEXT NOT NULL,
+          value TEXT NOT NULL,
+          PRIMARY KEY (env, key)
+      )
+
+* flags 表中与本样例相关的记录：
+  (env='dev', key='new_ui', value='false') 与
+  (env='qa',  key='new_ui', value='true')，均为严格文本；
+* 输出文件 dev.json 起初不存在。
+
+调用一（首次导出）：
+
+    python flagctl.py --db demo.sqlite export dev dev.json
+
+预期：
+
+* 退出码 0；stderr 为空；
+* stdout 为单行 `{"new_ui": false}` 加换行；
+* 新建的 dev.json 为无 BOM 的 UTF-8，文件字节内容与 stdout 完全
+  相同，即一行 `{"new_ui": false}` 加换行；
+* 源库保持原样：dev/qa 两行记录均不被修改，export 全程只读。
+
+依据：环境名 "dev" 通过 validate_env()；cmd_list() 以
+`WHERE env = 'dev'` 只取回 dev 的行，qa/new_ui=true 不在读取范围
+内；未知键行（若有）在 cmd_list() 中被 continue 跳过；dev 的
+new_ui 值为严格文本 "false"，经 stored_bool_text() 校验后映射为
+JSON 布尔 false——false 是实际保存的设置，不是缺省值；未设置的键
+不出现。随后路径比较不相等、os.path.exists 为假，os.open 以 O_EXCL
+排他创建成功，写入 `{"new_ui": false}\n` 的 UTF-8 字节，cmd_export()
+返回的文本由 main() 加换行写入 stdout，两者同文。
+
+调用二（对同一路径再次导出）：
+
+    python flagctl.py --db demo.sqlite export dev dev.json
+
+预期：
+
+* 退出码 2；stdout 为空；stderr 仅为 `EXPORT_EXISTS` 加换行；
+* dev.json 的字节内容与调用一结束时完全相同，不被截断或覆盖；
+* 源库记录保持原样。
+
+依据：配置读取仍先执行并成功（结果仍是 {"new_ui": false}），随后
+规范化路径不相等，os.path.exists("dev.json") 为真，cmd_export()
+抛 FlagError("EXPORT_EXISTS")，不会打开该文件。main() 走统一失败
+协议。即使两次检查之间由竞态导致 FileExistsError，os.open 的
+FileExistsError 分支也报同一个 EXPORT_EXISTS。
+
+附：把样例中的库换为“父目录存在但 demo.sqlite 缺失”“有效库缺 flags
+表”或“dev 环境无任何合法设置”的情形，同一命令导出 `{}`（stdout 与
+文件均为 `{}` 加换行，退出码 0），不补建源库；若 dev 的合法键值是
+"true"/"false" 之外的异常文本，则即使 dev.json 已存在，也先报
+STORAGE_ERROR（见第六节）。
+
+九、失败优先级汇总
+------------------
+
+按源码中的实际先后排列，排在前面的环节先报错；所有失败均退出码 2、
+stdout 为空、stderr 仅为错误码加换行：
+
+  1. EMPTY_ENV：环境名去除两端空白后为空（main() 中
+     validate_env()，先于一切存储与文件操作）。
+  2. STORAGE_ERROR：环境名合法后、读取配置期间发生——库父目录缺失、
+     目标文件不是有效 SQLite 数据库、flags 表缺少所需列，或目标环境
+     的合法键存有严格文本 "true"/"false" 之外的值
+     （open_flag_store() / stored_bool_text() 经 cmd_list() 上抛）。
+     此阶段不处理输出文件：已存在的输出文件不被触碰，不存在的也不会
+     被创建。
+  3. （非失败）库文件缺失但父目录存在、有效库缺 flags 表、目标环境无
+     设置：cmd_list() 翻译为空结果，导出 {}，不补建源库。
+  4. 配置读取成功后：
+     a. 输出路径与库路径的规范化绝对路径相同 -> EXPORT_WRITE_ERROR
+        （cmd_export() 的 abspath+normcase 比较，先于 exists 检查）；
+     b. 其他已存在的输出路径 -> EXPORT_EXISTS（os.path.exists 为真，
+        或 os.open 抛 FileExistsError 的竞态），原内容保留；
+     c. 排他创建失败（输出父目录缺失、无权限等其他 OSError）->
+        EXPORT_WRITE_ERROR，不创建目录；
+     d. 创建成功后写入失败（OSError）-> 尝试 os.remove() 删除本次
+        新建文件后报 EXPORT_WRITE_ERROR；删除自身的 OSError 被
+        contextlib.suppress 忽略，错误码不变，不保证文件消失（仅作
+        边界说明，见第七节）。
+
+十、源码依据索引
+----------------
+
+* normalize_env / validate_env：环境名 strip 与 EMPTY_ENV
+  （main() 的 export 分支在调用 cmd_export() 之前先行执行）。
+* cmd_export：导出总顺序——先 cmd_list() 读取并 json.dumps 序列化，
+  再做 abspath+normcase 路径比较（EXPORT_WRITE_ERROR）、
+  os.path.exists 检查（EXPORT_EXISTS），随后 os.open(O_EXCL)
+  排他创建（FileExistsError -> EXPORT_EXISTS，其他 OSError ->
+  EXPORT_WRITE_ERROR），os.fdopen 写入 UTF-8 字节；写入 OSError 时
+  contextlib.suppress(OSError) 包裹 os.remove() 清理并报
+  EXPORT_WRITE_ERROR。
+* cmd_list：SELECT key, value FROM flags WHERE env = ?；未知键
+  continue；VALUE_NOT_SET 翻译为 {}，STORAGE_ERROR 上抛；值经
+  stored_bool_text() 校验后映射为 JSON 布尔值。
+* open_flag_store：库文件缺失时按父目录区分 STORAGE_ERROR 与
+  VALUE_NOT_SET；缺 flags 表 -> VALUE_NOT_SET；连接失败与其他
+  sqlite3.Error（含无效库、所需列缺失）-> STORAGE_ERROR。
+* stored_bool_text：仅接受严格文本 "true"/"false"，否则
+  STORAGE_ERROR。
+* KNOWN_KEYS：当前只有 "new_ui"，决定导出中“合法键”的范围。
+* main()：FlagError -> stderr 输出错误码加换行、退出码 2；成功时
+  stdout 输出结果加换行、退出码 0；export 成功时 stdout 文本与文件
+  内容同文。
