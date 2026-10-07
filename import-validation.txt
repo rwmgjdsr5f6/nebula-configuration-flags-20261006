@@ -1,0 +1,169 @@
+flagctl import 导入前校验流程说明
+================================
+
+本文说明 `python flagctl.py --db <库文件> import <环境名> <JSON 文件> [--dry-run]`
+在访问数据库之前完成的全部校验。普通导入与 --dry-run 预览共享同一份校验代码，
+判定顺序、错误码完全一致；区别只在校验全部通过之后：普通导入写入存储，
+预览只读比对。本文只描述现有行为，依据 flagctl.py 中的函数与代码位置，
+不新增命令、不改变任何公开行为。
+
+一、整体流程概览
+----------------
+
+校验按以下顺序进行，任一环节失败即以对应错误码结束（main() 捕获
+FlagError 后把错误码加换行写入 stderr，退出码 2），且失败时不触碰
+任何存储对象：
+
+  1. 环境名处理（main() 中的 normalize_env / validate_env）
+  2. 文件读取（load_import_file）
+  3. JSON 解析（load_import_file，借助 _unique_object_pairs 与
+     _reject_constant）
+  4. 全部键名检查（load_import_file 调用 validate_key）
+  5. 全部布尔值检查（load_import_file 内联 isinstance 检查）
+  6. 空对象提前返回（cmd_import）
+  7. 校验全部通过后才进入写入（save_flags）或只读预览
+     （preview_changes）
+
+二、各环节的错误判定顺序
+------------------------
+
+1. 环境名处理 —— EMPTY_ENV
+
+   main() 对 import 与其他接收环境名的子命令走同一条路径：先调用
+   normalize_env(env) 去除环境名两端的空白（内部空格保留、大小写
+   敏感），再调用 validate_env(env)。去空白后为空串即抛
+   FlagError("EMPTY_ENV")。这一步发生在读取文件之前，因此环境名
+   非法时根本不会打开导入文件。
+
+2. 文件读取 —— IMPORT_READ_ERROR
+
+   cmd_import 调用 load_import_file(file_path)。该函数以二进制模式
+   打开并读取整个文件；文件不存在或任何其他 OSError（无权限、是
+   目录等）都统一报 IMPORT_READ_ERROR。
+
+3. JSON 解析 —— INVALID_JSON
+
+   读取成功后依次判定，全部归为 INVALID_JSON：
+
+   * 非法 UTF-8：raw.decode("utf-8") 抛出 UnicodeDecodeError 时
+     报 INVALID_JSON；
+   * JSON 语法错误：json.loads 抛出 ValueError 时报 INVALID_JSON；
+   * 重复键：json.loads 使用 object_pairs_hook=_unique_object_pairs，
+     任一对象内出现重复键即抛 FlagError("INVALID_JSON")。该钩子对
+     顶层对象和所有嵌套对象同样生效，因此嵌套重复键也按
+     INVALID_JSON 处理；
+   * 未加引号的 NaN、Infinity、-Infinity：json.loads 使用
+     parse_constant=_reject_constant，遇到这些非标准常量即抛
+     ValueError，由 load_import_file 归类为 INVALID_JSON。该回调
+     同样作用于嵌套位置，嵌套的非标准常量也按 INVALID_JSON 处理；
+   * 顶层不是对象：解析结果不是 dict（例如数组、字符串、数字）时
+     报 INVALID_JSON。
+
+4. 全部键名检查 —— UNKNOWN_KEY
+
+   解析通过后，load_import_file 先遍历全部键名，逐个调用
+   validate_key(key)：键不在 KNOWN_KEYS（目前只有 "new_ui"）中即
+   抛 FlagError("UNKNOWN_KEY")。注意这是对全部键的检查，任一未知
+   键都使整个文件被拒绝，而不是跳过该键。
+
+5. 全部布尔值检查 —— INVALID_BOOL
+
+   键名全部合法后才检查值：遍历全部值，isinstance(value, bool)
+   不成立即抛 FlagError("INVALID_BOOL")。字符串、数字、null
+   （None）、数组、对象都不是 JSON 布尔值，一律报 INVALID_BOOL。
+
+三、两个需要说明的判定细节
+--------------------------
+
+1. 字符串 "false" 与 JSON 布尔 false 的区别
+
+   JSON 文本 false 经 json.loads 解析为 Python 的 False，是 bool
+   的实例，通过第 5 步检查，是合法设置（导入后保存为文本
+   "false"）。而带引号的 "false" 解析为 Python 字符串，不是
+   bool，报 INVALID_BOOL。导入只接受 JSON 布尔字面量 true/false，
+   不接受字符串形式。
+
+2. 未知键与非法值同时出现时先报 UNKNOWN_KEY 的原因
+
+   load_import_file 中键名循环（第 4 步）完整结束后才进入值循环
+   （第 5 步），两个循环有固定先后。因此文件同时含有未知键和非法
+   值时，无论非法值出现在哪个键上，都先报 UNKNOWN_KEY。这样同一
+   个非法文件永远得到同一个错误码，判定结果不依赖字典遍历顺序或
+   错误出现的位置。
+
+四、空对象提前返回与普通导入/预览的分界
+--------------------------------------
+
+cmd_import 在 load_import_file 返回后立即判断：data 为空（即文件
+内容是合法的空对象 {}）时直接返回 {}，普通导入与 --dry-run 预览
+都走这同一个提前返回，均不访问数据库——即使数据库父目录不存在也
+不报 STORAGE_ERROR，因为根本不会调用 save_flags 或
+preview_changes。
+
+非空对象通过全部校验后才分流：
+
+* 普通导入：调用 save_flags() 写入（与 set 共用的持久化入口，整批
+  一个事务），返回导入的 {键名: 布尔值}，main() 以 sort_keys 输出
+  单行 JSON；
+* --dry-run：调用 preview_changes() 只读预览（与 set --dry-run 共
+  用的预览规则，经 cmd_list/open_flag_store 读取现状），只输出
+  变化键的 {"before": .., "after": ..}，不写入任何存储对象。
+
+两种模式共享第 1～6 步的全部判定，错误码与顺序完全一致。
+
+五、两次调用的预期（待验证预期，尚未执行）
+------------------------------------------
+
+以下为根据上述源码依据推导的预期行为，标注为待验证预期，本文不
+声称已经实际执行。
+
+固定前提：
+
+* 当前目录下 absent 目录不存在；
+* 当前目录已有 UTF-8 文件 candidate.json。
+
+调用一：candidate.json 内容为 {"new_ui":"false","other_key":true}
+
+  命令：
+    python flagctl.py --db absent/demo.sqlite import dev candidate.json --dry-run
+
+  预期：
+    退出码 2；stdout 为空；stderr 仅为 UNKNOWN_KEY 加换行。
+
+  依据：环境名 "dev" 通过 validate_env；文件可读且为合法 JSON
+  对象；键名检查先遇到 "other_key" 不在 KNOWN_KEYS 中，由
+  validate_key 抛 UNKNOWN_KEY。虽然 "new_ui" 的值是字符串
+  "false"（本属 INVALID_BOOL），但键名检查先于值检查，故报
+  UNKNOWN_KEY。校验在访问数据库之前失败，不创建 absent 目录、
+  不创建 demo.sqlite 库文件或 flags 表，也不改动 candidate.json。
+
+调用二：candidate.json 内容改为 {}
+
+  命令：
+    python flagctl.py --db absent/demo.sqlite import dev candidate.json --dry-run
+
+  预期：
+    退出码 0；stderr 为空；stdout 为 {} 加换行。
+
+  依据：{} 是合法 JSON 对象，键名与值检查对空对象自然通过；
+  cmd_import 的空对象提前返回直接给出 {}，不访问数据库，因此
+  absent 目录缺失也不报 STORAGE_ERROR。main() 对 --dry-run 结果
+  以紧凑分隔符序列化，空对象输出为 {}。同样不创建目录、库文件
+  或表，也不改动 candidate.json。
+
+六、源码依据索引
+----------------
+
+* normalize_env / validate_env：环境名去空白与 EMPTY_ENV
+  （flagctl.py 中 main() 的 import 分支先行调用）。
+* load_import_file：文件读取（IMPORT_READ_ERROR）、UTF-8 与语法
+  判定（INVALID_JSON）、键名循环（validate_key -> UNKNOWN_KEY）、
+  值循环（isinstance bool -> INVALID_BOOL）。
+* _unique_object_pairs：object_pairs_hook，重复键（含嵌套）->
+  INVALID_JSON。
+* _reject_constant：parse_constant，NaN/Infinity/-Infinity（含
+  嵌套）-> INVALID_JSON。
+* cmd_import：空对象提前返回 {}；非空时分流 save_flags（普通
+  导入）或 preview_changes（--dry-run）。
+* main()：FlagError -> stderr 输出错误码加换行、退出码 2；成功
+  时 stdout 输出结果加换行、退出码 0。
