@@ -61,6 +61,21 @@
   解除失败条件后以同一环境同一文件立即重试，退出 0、stderr 为空、
   stdout 为单行 {"new_ui": false} 加换行，dev 变为 false、qa 仍为
   true，完整记录仅这两条。
+* import --dry-run 只读预览非空导入的差异：固定样例 demo.sqlite 中
+  dev/new_ui=true、qa/new_ui=false，candidate.json 为内容
+  {"new_ui":false} 的 UTF-8 文件，import dev candidate.json
+  --dry-run 的 stdout 为单行
+  {"new_ui":{"before":true,"after":false}} 加换行，退出 0、stderr
+  为空，随后 get dev new_ui 仍输出 true；原值已是 false 时预览为
+  {}，目标记录不存在、父目录存在而库文件缺失或有效库没有 flags 表
+  时 before 为 null、after 为 false，不把未设置当成 false，也不补
+  建文件或表；合法空对象 {} 不访问存储，库路径父目录不存在时仍
+  输出 {} 且不创建目录，相同路径改用非空文件则报 STORAGE_ERROR；
+  目标 new_ui 的存储文本为 yes 时报 STORAGE_ERROR、保留原值、不
+  输出部分结果，其他环境或未知键的异常值不影响合法目标预览；每次
+  预览前后输入文件字节、库文件字节、完整记录与表结构均保持一致，
+  qa 记录保留；所有失败均退出 2、stdout 为空、stderr 仅为错误码
+  加换行，验收同时核对输出内容与调用后的文件状态。
 * export 把单环境已保存的直接设置导出为 JSON 文件：固定样例
   dev/new_ui=false、qa/new_ui=true 导出 dev 得到 {"new_ui": false}，
   stdout 与文件同为单行 JSON 加换行（无 BOM），再导入另一库的
@@ -2466,6 +2481,348 @@ sys.exit(flagctl.main())
         self.assertEqual(self.read_flags_columns(db), cols_before)
         with open(settings, "rb") as fh:
             self.assertEqual(fh.read(), settings_bytes, "重试后导入文件内容必须保持原样")
+
+
+class TestImportDryRunPreview(FlagctlCliTestCase):
+    """import --dry-run 只读预览差异的命令行回归测试。
+
+    主样例固定为 demo.sqlite 中 dev/new_ui=true、qa/new_ui=false，
+    candidate.json 是内容为 {"new_ui":false} 的 UTF-8 文件：预览
+    stdout 为单行 {"new_ui":{"before":true,"after":false}} 加换行，
+    退出 0、stderr 为空，随后 get dev new_ui 仍输出 true。另覆盖
+    原值已为 false（预览 {}）、目标记录缺失与库文件缺失/缺 flags 表
+    （before 为 null，未设置不被当成 false，不补建文件或表）、空对象
+    在父目录缺失时仍输出 {} 且不访问存储（同路径非空文件报
+    STORAGE_ERROR）、目标值损坏报 STORAGE_ERROR 且不输出部分结果、
+    其他环境与未知键的异常值不影响合法目标。
+
+    每次预览前后都核对输入文件字节、库文件字节、完整记录与表结构；
+    失败一律退出 2、stdout 为空、stderr 仅为错误码加换行。验收不仅
+    看退出码，还同时检查输出内容与调用后的文件状态。
+    """
+
+    def preview_flags(self, db, env, file_path):
+        """在全新进程中执行 import <env> <file> --dry-run。"""
+        return self.run_flagctl(db, "import", env, file_path, "--dry-run")
+
+    def make_demo_db(self):
+        """固定主样例库 demo.sqlite：dev/new_ui=true、qa/new_ui=false。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "false")],
+        )
+        return db
+
+    def write_candidate(self, content=b'{"new_ui":false}', name="candidate.json"):
+        """按固定文件名写入 UTF-8 导入文件（默认 candidate.json）。"""
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(content)
+        return path
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
+    def create_db_without_flags_table(self, db):
+        """创建只含无关表 notes（含一行数据）的有效 SQLite 库。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+                )
+                conn.execute("INSERT INTO notes (text) VALUES ('sample note')")
+        finally:
+            conn.close()
+
+    def read_notes_rows(self, db):
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute("SELECT id, text FROM notes ORDER BY id").fetchall()
+        finally:
+            conn.close()
+
+    def read_file_bytes(self, path):
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def snapshot_storage(self, db):
+        """采集库文件存在性、字节、表清单及 flags 表结构与完整记录。"""
+        snapshot = {"exists": os.path.exists(db)}
+        if snapshot["exists"]:
+            snapshot["bytes"] = self.read_file_bytes(db)
+            conn = sqlite3.connect(db)
+            try:
+                tables = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' "
+                        "ORDER BY name"
+                    ).fetchall()
+                ]
+                snapshot["tables"] = tables
+                if "flags" in tables:
+                    snapshot["columns"] = [
+                        row[1]
+                        for row in conn.execute("PRAGMA table_info(flags)").fetchall()
+                    ]
+                    snapshot["rows"] = conn.execute(
+                        "SELECT env, key, value FROM flags ORDER BY env, key"
+                    ).fetchall()
+                else:
+                    snapshot["columns"] = None
+                    snapshot["rows"] = None
+            finally:
+                conn.close()
+        return snapshot
+
+    def assert_storage_snapshot_unchanged(self, db, before):
+        """调用后的存储现场（文件字节、表结构、完整记录）必须与快照一致。"""
+        self.assertEqual(self.snapshot_storage(db), before)
+
+    def test_fixed_sample_previews_change_without_writing(self):
+        # 主样例：demo.sqlite 中 dev/new_ui=true、qa/new_ui=false，
+        # candidate.json 内容为 {"new_ui":false}。预览 stdout 为单行
+        # {"new_ui":{"before":true,"after":false}} 加换行，退出 0、
+        # stderr 为空；预览不写入，get dev new_ui 仍输出 true，qa 保留。
+        db = self.make_demo_db()
+        candidate = self.write_candidate()
+        self.assertEqual(self.read_file_bytes(candidate), b'{"new_ui":false}')
+
+        before = self.snapshot_storage(db)
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandOk(
+            proc, '{"new_ui":{"before":true,"after":false}}'
+        )
+        # 输入文件字节与库现场（文件字节、表结构、完整记录）保持一致。
+        self.assertEqual(self.read_file_bytes(candidate), b'{"new_ui":false}')
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "false")],
+        )
+        self.assertEqual(self.read_table_names(db), ["flags"])
+        self.assertEqual(self.read_flags_columns(db), ["env", "key", "value"])
+
+        # 随后正式读取：dev 仍是 true（false 是预览值而非已落库的值），
+        # qa 的记录也保留为 false。
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+    def test_existing_false_previews_empty_object(self):
+        # 原值已经是 false 时没有变化：预览为 {}，退出 0、stderr 为空，
+        # 库文件字节、完整记录与表结构保持不变，dev 仍读出 false。
+        db = self.db_path("already_false")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        candidate = self.write_candidate(name="candidate_false.json")
+
+        before = self.snapshot_storage(db)
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandOk(proc, "{}")
+        self.assertEqual(self.read_file_bytes(candidate), b'{"new_ui":false}')
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "false")],
+        )
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+
+    def test_missing_target_row_previews_null_before(self):
+        # 目标环境没有目标记录：before 为 null、after 为 false；未设置
+        # 不能被当成 false——预览后 dev 仍无记录（get 报 VALUE_NOT_SET），
+        # 也不新增行；qa 的既有记录保留。
+        db = self.db_path("missing_row")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "false")])
+        candidate = self.write_candidate(name="candidate_null_row.json")
+
+        before = self.snapshot_storage(db)
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandOk(
+            proc, '{"new_ui":{"before":null,"after":false}}'
+        )
+        self.assertEqual(self.read_file_bytes(candidate), b'{"new_ui":false}')
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "false")])
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+    def test_missing_db_file_previews_null_without_creating_file(self):
+        # 父目录存在而库文件缺失：非空文件预览以 null 表示原值，
+        # 退出 0，不补建库文件，临时目录内文件清单不变。
+        db = self.db_path("preview_missing_db")
+        self.assertFalse(os.path.exists(db))
+        candidate = self.write_candidate(name="candidate_missing_db.json")
+        listing_before = sorted(os.listdir(self.tmpdir))
+
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandOk(
+            proc, '{"new_ui":{"before":null,"after":false}}'
+        )
+        self.assertFalse(os.path.exists(db), "预览不得补建数据库文件: %s" % db)
+        self.assertEqual(
+            sorted(os.listdir(self.tmpdir)),
+            listing_before,
+            "预览不得在临时目录内新增任何文件",
+        )
+        self.assertEqual(self.read_file_bytes(candidate), b'{"new_ui":false}')
+
+    def test_valid_db_without_flags_table_previews_null_without_creating_table(self):
+        # 有效库没有 flags 表：非空文件预览以 null 表示原值，不补建
+        # flags 表，原有表与其数据、库文件字节均保持不变。
+        db = self.db_path("preview_no_flags_table")
+        self.create_db_without_flags_table(db)
+        self.assertEqual(self.read_table_names(db), ["notes"])
+        candidate = self.write_candidate(name="candidate_no_table.json")
+
+        before = self.snapshot_storage(db)
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandOk(
+            proc, '{"new_ui":{"before":null,"after":false}}'
+        )
+        self.assertEqual(self.read_file_bytes(candidate), b'{"new_ui":false}')
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(self.read_table_names(db), ["notes"])
+        self.assertEqual(self.read_notes_rows(db), [(1, "sample note")])
+
+    def test_empty_object_missing_parent_succeeds_nonempty_errors(self):
+        # 合法空对象 {} 在库路径父目录不存在时仍成功输出 {}，不创建
+        # 目录或访问存储；相同库路径改用非空文件则报 STORAGE_ERROR，
+        # 目录与库文件仍不存在。两种调用的输入文件字节都保持不变。
+        missing_dir = os.path.join(self.tmpdir, "no_such_parent")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+        empty_file = self.write_candidate(b"{}", name="empty.json")
+        nonempty_file = self.write_candidate(
+            b'{"new_ui":false}', name="nonempty.json"
+        )
+
+        empty_proc = self.preview_flags(db, "dev", empty_file)
+        self.assertCommandOk(empty_proc, "{}")
+        self.assertFalse(
+            os.path.exists(missing_dir), "空对象预览不得创建缺失的父目录"
+        )
+        self.assertFalse(os.path.exists(db), "空对象预览不得创建数据库文件")
+        self.assertEqual(self.read_file_bytes(empty_file), b"{}")
+
+        nonempty_proc = self.preview_flags(db, "dev", nonempty_file)
+        self.assertCommandError(nonempty_proc, "STORAGE_ERROR")
+        self.assertFalse(
+            os.path.exists(missing_dir), "非空预览失败不得创建缺失的父目录"
+        )
+        self.assertFalse(os.path.exists(db), "非空预览失败不得创建数据库文件")
+        self.assertEqual(
+            self.read_file_bytes(nonempty_file), b'{"new_ui":false}'
+        )
+
+    def test_corrupt_target_value_reports_storage_error_without_partial_output(self):
+        # 目标 new_ui 的存储文本为 yes：报 STORAGE_ERROR，退出 2、
+        # stdout 为空、stderr 仅为 STORAGE_ERROR 加换行；保留原值 yes，
+        # 不输出部分结果，库文件字节、完整记录与表结构不变，qa 保留。
+        db = self.db_path("preview_bad_target")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "yes"), ("qa", "new_ui", "false")],
+        )
+        candidate = self.write_candidate(name="candidate_bad_target.json")
+
+        before = self.snapshot_storage(db)
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandError(proc, "STORAGE_ERROR")
+        self.assertEqual(
+            self.read_file_bytes(candidate), b'{"new_ui":false}'
+        )
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "yes"), ("qa", "new_ui", "false")],
+        )
+        self.assertEqual(self.read_flags_columns(db), ["env", "key", "value"])
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "STORAGE_ERROR")
+
+    def test_invalid_value_in_other_env_does_not_affect_preview(self):
+        # 其他环境的异常值不在目标范围内：qa/new_ui=yes 不影响 dev 的
+        # 合法预览；预览后异常原值原样保留，库文件字节与完整记录不变。
+        db = self.db_path("preview_other_env_bad")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "yes")],
+        )
+        candidate = self.write_candidate(name="candidate_other_env.json")
+
+        before = self.snapshot_storage(db)
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandOk(
+            proc, '{"new_ui":{"before":true,"after":false}}'
+        )
+        self.assertEqual(
+            self.read_file_bytes(candidate), b'{"new_ui":false}'
+        )
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "yes")],
+        )
+
+    def test_anomalous_unknown_key_values_do_not_affect_preview(self):
+        # 未知键（含其异常值，无论是否在目标环境内）一律忽略：
+        # 合法目标 dev/new_ui=true 的预览正常输出差异，预览后未知键
+        # 异常行原样保留，库文件字节与完整记录不变。
+        db = self.db_path("preview_unknown_key_bad")
+        self.seed_flags_table(
+            db,
+            [
+                ("dev", "new_ui", "true"),
+                ("dev", "other_key", "yes"),
+                ("qa", "other_key", "maybe"),
+            ],
+        )
+        candidate = self.write_candidate(name="candidate_unknown_key.json")
+
+        before = self.snapshot_storage(db)
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandOk(
+            proc, '{"new_ui":{"before":true,"after":false}}'
+        )
+        self.assertEqual(
+            self.read_file_bytes(candidate), b'{"new_ui":false}'
+        )
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [
+                ("dev", "new_ui", "true"),
+                ("dev", "other_key", "yes"),
+                ("qa", "other_key", "maybe"),
+            ],
+        )
 
 
 class TestExport(FlagctlCliTestCase):
