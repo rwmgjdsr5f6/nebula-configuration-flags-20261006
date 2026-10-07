@@ -9,6 +9,7 @@
     python flagctl.py --db <数据库文件> diff <环境名左> <环境名右>
     python flagctl.py --db <数据库文件> envs
     python flagctl.py --db <数据库文件> import <环境名> <JSON 文件>
+    python flagctl.py --db <数据库文件> export <环境名> <JSON 文件>
 
 仅使用 Python 3 标准库与 SQLite，不依赖网络或第三方包。
 """
@@ -318,6 +319,52 @@ def cmd_import(db_path, env, file_path):
     return data
 
 
+def cmd_export(db_path, env, file_path):
+    """把一个环境已保存的直接设置导出为 JSON 文件，返回单行 JSON 文本。
+
+    导出对象与 list 的输出一致：仅含目标环境已保存的合法键，值为 JSON
+    布尔值；false 原样保留，未设置的键不出现，不补默认值或继承值。
+    配置读取完全复用 cmd_list 的唯一一份存储分类与值校验规则：库文件
+    缺失但父目录存在、有效库缺 flags 表或环境无合法设置时导出 {}
+    （不创建数据库或表）；父目录缺失、无效库、查询所需列缺失或目标
+    环境的合法键存有严格文本 true/false 之外的值时报 STORAGE_ERROR，
+    此时不创建也不改动输出文件。未知键及其他环境的异常值不影响导出。
+
+    严格按“先完整读取配置、后处理输出文件”的顺序：读取全部通过后，
+    输出路径与数据库路径的规范化绝对路径相同则报 EXPORT_WRITE_ERROR；
+    输出路径已存在则报 EXPORT_EXISTS 并保留原内容。写入以排他创建
+    进行：父目录缺失、无法写入或写入失败都报 EXPORT_WRITE_ERROR，
+    不创建目录，失败时清理本次新建的残缺文件，不遗留部分输出。
+    文件为无 BOM 的 UTF-8，内容是单行 JSON 对象加换行，与 stdout
+    输出的文本完全相同。全程只读源库，不改动任何记录。
+    """
+    data = cmd_list(db_path, env)
+    text = json.dumps(data, sort_keys=True)
+    if os.path.normcase(os.path.abspath(file_path)) == os.path.normcase(
+        os.path.abspath(db_path)
+    ):
+        raise FlagError("EXPORT_WRITE_ERROR")
+    if os.path.exists(file_path):
+        raise FlagError("EXPORT_EXISTS")
+    try:
+        # 排他创建：已存在的文件不会被打开，更不会被截断或覆盖。
+        fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    except FileExistsError:
+        # 与上面 exists 检查之间的竞态：按同一规则报 EXPORT_EXISTS。
+        raise FlagError("EXPORT_EXISTS")
+    except OSError:
+        raise FlagError("EXPORT_WRITE_ERROR")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write((text + "\n").encode("utf-8"))
+    except OSError:
+        # 写入中途失败：清理由本次调用新建的文件，不遗留残缺输出。
+        with contextlib.suppress(OSError):
+            os.remove(file_path)
+        raise FlagError("EXPORT_WRITE_ERROR")
+    return text
+
+
 def cmd_envs(db_path):
     """列出库中至少有一个合法键直接设置的环境名，返回名称列表。
 
@@ -387,6 +434,10 @@ def build_parser():
     p_import.add_argument("env")
     p_import.add_argument("file")
 
+    p_export = sub.add_parser("export", help="把环境的直接设置导出为 JSON 文件")
+    p_export.add_argument("env")
+    p_export.add_argument("file")
+
     return parser
 
 
@@ -419,6 +470,11 @@ def main(argv=None):
                 result = json.dumps(
                     cmd_import(args.db, env, args.file), sort_keys=True
                 )
+            elif args.command == "export":
+                # export 接收环境名和输出文件路径：环境名校验先于读取
+                # 配置，配置完整读取后才处理输出文件；stdout 与文件内容
+                # 是同一份单行 JSON 文本。
+                result = cmd_export(args.db, env, args.file)
             else:
                 validate_key(args.key)
                 if args.command == "set":
