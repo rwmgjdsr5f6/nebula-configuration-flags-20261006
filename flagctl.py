@@ -4,7 +4,7 @@
 用法:
     python flagctl.py --db <数据库文件> set <环境名> <键名> <true|false> [--dry-run]
     python flagctl.py --db <数据库文件> get <环境名> <键名>
-    python flagctl.py --db <数据库文件> unset <环境名> <键名>
+    python flagctl.py --db <数据库文件> unset <环境名> <键名> [--dry-run]
     python flagctl.py --db <数据库文件> list <环境名>
     python flagctl.py --db <数据库文件> diff <环境名左> <环境名右>
     python flagctl.py --db <数据库文件> envs
@@ -189,7 +189,38 @@ def cmd_get(db_path, env, key):
     return stored_bool_text(row[0])
 
 
-def cmd_unset(db_path, env, key):
+def preview_unset(db_path, env, key):
+    """只读预览撤销单个键的直接设置将带来的变化。
+
+    返回 {键名: {"before": 当前布尔值, "after": None}}；撤销永远把整行
+    删除，因此 after 固定为 null，不存在“撤销后保留 false”。原值 false
+    与 true 一样是有效设置，同样输出变化，不被视为未设置；不补默认值
+    或继承值。
+
+    存储分类与值校验完全复用 cmd_get() 唯一一份的单行读取规则
+    （open_flag_store() + stored_bool_text()）：库文件缺失但父目录存在、
+    有效库缺 flags 表或目标行不存在时报 VALUE_NOT_SET；父目录缺失、
+    无效库、所需列缺失、连接或查询失败、目标行值不是严格文本
+    true/false 时报 STORAGE_ERROR。其他环境及未知键记录不在读取范围
+    内，其异常值不影响预览。纯只读，不创建目录、库文件或表，不改动
+    任何记录、不修复异常值。
+    """
+    value = cmd_get(db_path, env, key)
+    return {key: {"before": value == "true", "after": None}}
+
+
+def cmd_unset(db_path, env, key, dry_run=False):
+    """删除一个直接设置（删除整行而非写入 false），成功时回显 unset。
+
+    dry_run=True 时完全不删除，改为只读预览单键变化，输出只含该键的
+    {"before": 当前布尔值, "after": None}：原值严格文本 true/false 时
+    before 为对应 JSON 布尔值，after 为 null；目标行不存在（含库文件
+    缺失、缺 flags 表）报 VALUE_NOT_SET，原值非法报 STORAGE_ERROR。
+    输入校验顺序、错误码与正式 unset 一致，全程不创建或改动任何存储
+    对象，也不修复异常值。
+    """
+    if dry_run:
+        return preview_unset(db_path, env, key)
     with open_flag_store(db_path) as conn:
         # 不补建 flags 表：缺表与没有目标记录一样视为值未设置（由
         # open_flag_store 统一分类）。直接按主键删除，以 rowcount 是否
@@ -478,6 +509,11 @@ def build_parser():
     p_unset = sub.add_parser("unset", help="撤销开关的直接设置")
     p_unset.add_argument("env")
     p_unset.add_argument("key")
+    p_unset.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只预览撤销该键将发生的变化，不删除记录",
+    )
 
     p_list = sub.add_parser("list", help="列出环境已保存的开关")
     p_list.add_argument("env")
@@ -564,7 +600,17 @@ def main(argv=None):
                     else:
                         result = cmd_set(args.db, env, args.key, value)
                 elif args.command == "unset":
-                    result = cmd_unset(args.db, env, args.key)
+                    if args.dry_run:
+                        # unset --dry-run 与 set/import --dry-run 共用同一
+                        # 预览输出形式：内层固定先 before 后 after；不用
+                        # sort_keys，以免调换两个字段的顺序。紧凑分隔符，
+                        # 输出 {"key":{"before":..,"after":null}}。
+                        result = json.dumps(
+                            cmd_unset(args.db, env, args.key, True),
+                            separators=(",", ":"),
+                        )
+                    else:
+                        result = cmd_unset(args.db, env, args.key)
                 else:
                     result = cmd_get(args.db, env, args.key)
     except FlagError as exc:

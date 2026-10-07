@@ -76,6 +76,27 @@ PRIMARY KEY (env, key))。
   效果：cmd_unset() 删除 (dev, new_ui) 这一行，而不是写入 false。
   删除后 demo.sqlite 仍是有效库、flags 表仍在，只是该记录不存在。
 
+  附加 --dry-run 时完全不删除，改为只读预览这次撤销将带来的变化
+  （cmd_unset(dry_run=True) 经 preview_unset() 复用 cmd_get() 的单行
+  读取与校验规则）。以上面固定的 false 样例为例：
+
+    输入：
+        python flagctl.py --db demo.sqlite unset dev new_ui --dry-run
+
+    预期（stdout 单行紧凑 JSON，退出码 0，stderr 为空）：
+
+        {"new_ui":{"before":false,"after":null}}
+
+  含义：before 是该行当前值（严格文本 false 映射为 JSON 布尔 false，
+  true 同理映射 true）；after 固定为 null，表示撤销后该行不存在，而
+  不是保留一行 false。原值为 false 同样输出变化，不视为未设置；预览
+  不接收布尔值参数，也不补默认值或继承值。目标行不存在（含父目录存在
+  但库文件缺失、有效库缺 flags 表）报 VALUE_NOT_SET；父目录缺失、无效
+  库、所需列缺失、连接或查询失败、目标行值不是严格文本 true/false 报
+  STORAGE_ERROR，不输出部分结果；其他环境与未知键记录不影响预览。预览
+  全程只读：库文件字节、flags 表与全部记录（含异常原值）保持不变，随后
+  执行 get dev new_ui 仍输出 false。
+
 2.3 撤销之后的四项预期
 
     输入：
@@ -109,7 +130,9 @@ PRIMARY KEY (env, key))。
 
 * 成功：退出码 0；stderr 为空；stdout 为单行结果加换行（"\n"）。
   - diff / list 的结果是一行 JSON 对象；
-  - get 输出 true 或 false；unset 成功输出 unset；set 回显所设值。
+  - get 输出 true 或 false；unset 成功输出 unset；set 回显所设值；
+  - unset 附加 --dry-run 时为例外：不执行删除，stdout 是紧凑单行 JSON
+    变化对象 {"new_ui":{"before":false,"after":null}}，after 恒为 null。
 * 业务/存储错误：退出码 2（EXIT_ERROR）；stdout 为空；stderr 仅为
   错误码加换行，如 VALUE_NOT_SET\n，不附带其他文本。
 * JSON 中空格的多少不影响含义；布尔与空值使用 JSON 的 true、false、
@@ -142,6 +165,10 @@ PRIMARY KEY (env, key))。
 * 父目录不存在：报 STORAGE_ERROR。
 * 目标文件不是有效 SQLite 数据库：报 STORAGE_ERROR。
 * flags 表存在但查询所需列缺失（如缺少 value 列）：报 STORAGE_ERROR。
+* unset --dry-run 复用 cmd_get() 的单行读取分类，与正式 unset 完全
+  一致：上述三种“没有数据”状态报 VALUE_NOT_SET，其余报 STORAGE_ERROR；
+  目标行存在但值不是严格文本 "true"/"false" 同样报 STORAGE_ERROR，
+  不修复异常值。它是纯只读操作，不删除行、不创建任何对象。
 
 数据内容校验（cmd_list() 被 cmd_diff() 复用）：
 
@@ -155,4 +182,7 @@ PRIMARY KEY (env, key))。
 
 * diff 全程只读，只做 SELECT，副作用为零；
 * unset 的语义是 DELETE 目标行，绝不通过把值改成 false 来表达“撤销”；
-  撤销之后该键回到“未设置”，与从未设置过的状态不可区分。
+  撤销之后该键回到“未设置”，与从未设置过的状态不可区分；
+* unset --dry-run 全程只读，只做与 get 相同的单行 SELECT：输出
+  before/after 变化对象但绝不 DELETE，也不创建目录、库文件或表、不修复
+  异常值；重复预览结果相同，预览后该键仍可被 get 读到原值。

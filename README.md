@@ -44,7 +44,7 @@ stderr 均为空。
 
     python flagctl.py --db <库> set <环境> <键> <true|false> [--dry-run]
     python flagctl.py --db <库> get <环境> <键>
-    python flagctl.py --db <库> unset <环境> <键>
+    python flagctl.py --db <库> unset <环境> <键> [--dry-run]
     python flagctl.py --db <库> list <环境>
     python flagctl.py --db <库> diff <环境左> <环境右>
     python flagctl.py --db <库> envs
@@ -67,7 +67,19 @@ stderr 均为空。
   相同结果。
 - **get**：读取一个直接设置，stdout 为 `true` 或 `false`。
 - **unset**：删除该环境该键的直接设置（删除整行记录，而不是写入
-  `false`）；成功时 stdout 为 `unset`。
+  `false`）；成功时 stdout 为 `unset`。附加 `--dry-run` 时完全不删除，
+  只在正式删除前只读预览这一个键将发生的变化：stdout 为单行紧凑 JSON
+  对象，形如 `{"new_ui":{"before":false,"after":null}}`，`before` 是目标
+  行当前的严格文本值（`true` / `false` 映射为同名 JSON 布尔值），
+  `after` 固定为 `null` 表示撤销后该行不存在；原值 `false` 与 `true`
+  一样输出变化，不被当作未设置，预览也不补默认值或继承值。预览严格按
+  环境名 → 键名的顺序校验（unset 不接收布尔值参数），全部通过后才读取
+  存储（错误码与正式 unset 一致）；父目录存在但库文件缺失、有效库缺
+  flags 表或目标行不存在报 VALUE_NOT_SET，父目录缺失、无效库、查询所需
+  列缺失、连接或查询失败或目标行值不是严格文本 `true`/`false` 时报
+  STORAGE_ERROR，不输出部分结果；其他环境和未知键记录不影响预览。预览
+  全程不创建目录、库文件或表，也不改动记录或修复异常值，重复调用得到
+  相同结果。
 - **list**：输出该环境所有已保存开关组成的 JSON 对象，值为 JSON
   布尔值，例如 `{"new_ui": false}`；没有任何已保存开关时输出 `{}`。
 - **diff**：按参数顺序比较两个环境的直接设置，只输出两侧不同的键，
@@ -138,7 +150,7 @@ stderr 均为空。
 - 同一 (env, key) 再次 set 会覆盖旧行（INSERT OR REPLACE）；
 - **set 首次写入时**（以及非空 import 首次导入时）会创建缺失的
   数据库文件并用 `CREATE TABLE IF NOT EXISTS` 建表；
-- **get、unset、list、diff、envs 以及 set/import 的 --dry-run 预览不
+- **get、unset、list、diff、envs 以及 set/import/unset 的 --dry-run 预览不
   补建任何文件或表**：库文件不存在或缺 flags 表时按各自的错误/空结果
   规则处理。
 
@@ -146,7 +158,8 @@ stderr 均为空。
 
 - **成功**：退出码 0；stderr 为空；stdout 为单行结果加换行。
   set/get 输出布尔文本（set 附加 `--dry-run` 时为例外，输出紧凑的
-  单行 JSON 变化对象），unset 输出 `unset`，list/diff 输出一行
+  单行 JSON 变化对象），unset 输出 `unset`（附加 `--dry-run` 时同为
+  例外，输出紧凑的单行 JSON 变化对象），list/diff 输出一行
   JSON 对象，envs 输出一行 JSON 数组。
 - **失败**：退出码 2；stdout 为空；stderr 仅为错误码加换行，
   例如 `VALUE_NOT_SET`，不附带其他文本。
@@ -165,14 +178,15 @@ stderr 均为空。
   顶层不是对象或存在重复键。未加引号的 `NaN`、`Infinity`、
   `-Infinity` 不是合法 JSON 词法（出现在任意嵌套位置都算语法错误，
   先于键名与布尔值校验）；引号内的同名文本只是普通字符串。
-- **VALUE_NOT_SET**：get 或 unset 的目标 (环境, 键) 没有已保存的
-  记录。父目录存在但数据库文件缺失、或文件是有效 SQLite 库但缺少
-  flags 表时，也按此处理——查询不会顺手补建文件或表。
+- **VALUE_NOT_SET**：get、unset 或 unset `--dry-run` 的目标
+  (环境, 键) 没有已保存的记录。父目录存在但数据库文件缺失、或文件是
+  有效 SQLite 库但缺少 flags 表时，也按此处理——查询不会顺手补建文件
+  或表。
 - **STORAGE_ERROR**：父目录不存在；目标文件不是有效的 SQLite 数据库；
   操作所需的表列缺失；以及 get、list、diff、envs、export 和
-  set --dry-run 在目标范围内读到已知键保存了 `true` / `false` 之外的
-  非法值（数据损坏）。envs 的目标范围是全库：库中任一合法键的值非法
-  都报此错，不输出部分名单。
+  set/unset --dry-run 在目标范围内读到已知键保存了 `true` / `false`
+  之外的非法值（数据损坏）。envs 的目标范围是全库：库中任一合法键的
+  值非法都报此错，不输出部分名单。
 - **EXPORT_EXISTS**：export 的输出文件已存在；原内容保留，不被覆盖。
 - **EXPORT_WRITE_ERROR**：export 的输出路径与数据库路径相同、输出
   父目录不存在、无法写入或写入失败。不创建目录，失败不遗留新增的
@@ -184,6 +198,10 @@ stderr 均为空。
   访问存储之前拒绝，因此输入校验失败不会创建数据库文件或表；附加
   `--dry-run` 时校验顺序与错误码不变，只是在全部校验通过后只读查询
   原值并输出变化，绝不写入。
+- unset 严格按 **环境名 → 键名** 的顺序校验（不接收布尔值参数），
+  任一失败都在访问存储之前拒绝，因此输入校验失败不会访问或创建数据库
+  文件或表；附加 `--dry-run` 时校验顺序与错误码不变，只是在全部校验
+  通过后只读查询原值并输出变化，绝不删除或改动任何记录。
 - import 严格按 **环境名 → 读文件 → JSON 解析 → 全部键名 → 全部
   布尔值** 的顺序校验，全部通过后才访问数据库；校验失败不会创建
   数据库或表，也不会改动任何记录。非空导入在一个事务中写入，遇到
