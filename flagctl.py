@@ -120,19 +120,31 @@ def open_flag_store(db_path):
         conn.close()
 
 
-def cmd_set(db_path, env, key, value):
+def save_flags(db_path, env, items):
+    """set 与非空 import 共用的直接设置持久化入口，规则只维护一份。
+
+    items 是 (键名, 布尔文本) 对的序列，全部写入同一个环境。创建缺失
+    的数据库文件和 flags 表，但不创建父目录；同名键覆盖旧值（false 是
+    有效设置），其他环境及未提及的记录保持原样。整批写入在一个事务中
+    完成：父目录不存在、目标不是有效数据库、flags 表缺少所需列或写入
+    失败都统一报 STORAGE_ERROR，既有记录保持原样。
+    """
     conn = connect(db_path)
     try:
         with conn:
             conn.execute(SCHEMA)
-            conn.execute(
+            conn.executemany(
                 "INSERT OR REPLACE INTO flags (env, key, value) VALUES (?, ?, ?)",
-                (env, key, value),
+                [(env, key, value) for key, value in items],
             )
     except sqlite3.Error:
         raise FlagError("STORAGE_ERROR")
     finally:
         conn.close()
+
+
+def cmd_set(db_path, env, key, value):
+    save_flags(db_path, env, [(key, value)])
     return value
 
 
@@ -289,29 +301,20 @@ def cmd_import(db_path, env, file_path):
 
     导入覆盖目标环境中出现的同名键，保留其他环境和文件中未出现的
     记录；false 是实际设置而非删除。空对象 {} 直接成功返回，不访问
-    数据库。非空导入沿用 set 的存储行为：创建缺失的数据库文件和
-    flags 表，但不创建父目录；父目录不存在、目标不是有效数据库、
-    flags 表缺少所需列或写入失败都报 STORAGE_ERROR，整个导入在
-    一个事务中完成，失败时既有记录保持原样。
+    数据库。非空导入与 set 共用唯一一份持久化规则 save_flags()：
+    创建缺失的数据库文件和 flags 表，但不创建父目录；父目录不存在、
+    目标不是有效数据库、flags 表缺少所需列或写入失败都报
+    STORAGE_ERROR，整个导入在一个事务中完成，失败时既有记录保持
+    原样。
     """
     data = load_import_file(file_path)
     if not data:
         return {}
-    conn = connect(db_path)
-    try:
-        with conn:
-            conn.execute(SCHEMA)
-            conn.executemany(
-                "INSERT OR REPLACE INTO flags (env, key, value) VALUES (?, ?, ?)",
-                [
-                    (env, key, "true" if data[key] else "false")
-                    for key in sorted(data)
-                ],
-            )
-    except sqlite3.Error:
-        raise FlagError("STORAGE_ERROR")
-    finally:
-        conn.close()
+    save_flags(
+        db_path,
+        env,
+        [(key, "true" if data[key] else "false") for key in sorted(data)],
+    )
     return data
 
 
