@@ -48,6 +48,7 @@ stderr 均为空。
     python flagctl.py --db <库> list <环境>
     python flagctl.py --db <库> diff <环境左> <环境右>
     python flagctl.py --db <库> envs
+    python flagctl.py --db <库> import <环境> <JSON 文件>
 
 - **set**：保存或覆盖一个直接设置，成功时 stdout 回显所写入的
   `true` / `false`。
@@ -68,6 +69,13 @@ stderr 均为空。
   保留空白，`Dev` 与 `dev` 分开列出）。库文件缺失、有效库缺 flags
   表或没有合法键记录时输出 `[]`。envs 为只读命令，不补建目录、
   文件或表。
+- **import**：从本地 JSON 文件导入一个环境的直接设置。文件采用
+  UTF-8，内容与 list 输出相同（顶层为对象，键是开关名、值是 JSON
+  布尔值），例如 `{"new_ui": false}`。导入覆盖目标环境中出现的
+  同名键，保留其他环境和文件中未出现的记录；`false` 是实际设置，
+  不代表删除。成功时 stdout 为仅含本次导入项的单行 JSON 对象；
+  空对象 `{}` 直接成功返回 `{}`，不访问数据库。非空导入沿用 set
+  的存储行为：创建缺失的数据库文件和 flags 表，但不创建父目录。
 
 关于“直接设置为 false”与“未设置（null）”的区别，以及 unset、diff
 在这条流程上的完整行为，见 [direct-setting.txt](direct-setting.txt)。
@@ -95,8 +103,8 @@ stderr 均为空。
 
 - value 列只保存严格文本 `true` 或 `false`；
 - 同一 (env, key) 再次 set 会覆盖旧行（INSERT OR REPLACE）；
-- **set 首次写入时**会创建缺失的数据库文件并用
-  `CREATE TABLE IF NOT EXISTS` 建表；
+- **set 首次写入时**（以及非空 import 首次导入时）会创建缺失的
+  数据库文件并用 `CREATE TABLE IF NOT EXISTS` 建表；
 - **get、unset、list、diff、envs 不补建任何文件或表**：库文件不存在
   或缺 flags 表时按下文的错误/空结果规则处理。
 
@@ -111,9 +119,15 @@ stderr 均为空。
 ## 错误码
 
 - **EMPTY_ENV**：环境名为空，或去除两端空白后为空。diff 的两个环境
-  名都会在访问存储之前校验，任一为空即报此错。
-- **UNKNOWN_KEY**：键名不是当前合法键（`new_ui`）。
-- **INVALID_BOOL**：set 给出的值不是严格小写的 `true` / `false`。
+  名都会在访问存储之前校验，任一为空即报此错；import 在读文件之前
+  校验环境名。
+- **UNKNOWN_KEY**：键名不是当前合法键（`new_ui`）。import 在解析
+  文件后先校验全部键名。
+- **INVALID_BOOL**：set 给出的值不是严格小写的 `true` / `false`；
+  或 import 文件中的值不是 JSON 布尔值（如 `"false"`、`1`、`null`）。
+- **IMPORT_READ_ERROR**：import 的文件不存在或无法读取。
+- **INVALID_JSON**：import 的文件不是合法 UTF-8、JSON 语法错误、
+  顶层不是对象或存在重复键。
 - **VALUE_NOT_SET**：get 或 unset 的目标 (环境, 键) 没有已保存的
   记录。父目录存在但数据库文件缺失、或文件是有效 SQLite 库但缺少
   flags 表时，也按此处理——查询不会顺手补建文件或表。
@@ -126,6 +140,11 @@ stderr 均为空。
 
 - set 严格按 **环境名 → 键名 → 布尔文本** 的顺序校验，任一失败都在
   访问存储之前拒绝，因此输入校验失败不会创建数据库文件或表。
+- import 严格按 **环境名 → 读文件 → JSON 解析 → 全部键名 → 全部
+  布尔值** 的顺序校验，全部通过后才访问数据库；校验失败不会创建
+  数据库或表，也不会改动任何记录。非空导入在一个事务中写入，遇到
+  父目录不存在、无效数据库、flags 表缺少所需列或写入失败时报
+  STORAGE_ERROR，既有记录保持原样。
 - list 不把“没有数据”当作错误：数据库文件缺失、有效库缺少 flags 表
   或该环境没有任何记录，都输出 `{}`。
 - envs 同样不把“没有数据”当作错误：数据库文件缺失、有效库缺少

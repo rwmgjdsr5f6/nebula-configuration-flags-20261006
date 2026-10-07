@@ -8,6 +8,7 @@
     python flagctl.py --db <数据库文件> list <环境名>
     python flagctl.py --db <数据库文件> diff <环境名左> <环境名右>
     python flagctl.py --db <数据库文件> envs
+    python flagctl.py --db <数据库文件> import <环境名> <JSON 文件>
 
 仅使用 Python 3 标准库与 SQLite，不依赖网络或第三方包。
 """
@@ -211,6 +212,82 @@ def cmd_diff(db_path, left_env, right_env):
     return result
 
 
+def _unique_object_pairs(pairs):
+    """json.loads 的 object_pairs_hook：发现重复键即拒绝整个文件。"""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise FlagError("INVALID_JSON")
+        result[key] = value
+    return result
+
+
+def load_import_file(file_path):
+    """读取并校验导入文件，返回 {键名: 布尔值}。
+
+    校验全部在访问数据库之前完成，失败时不触碰任何存储：
+
+    * 文件不存在或无法读取 -> IMPORT_READ_ERROR；
+    * 非法 UTF-8、JSON 语法错误、顶层不是对象、存在重复键 -> INVALID_JSON；
+    * 先校验全部键名，未知键 -> UNKNOWN_KEY；
+    * 再校验全部值，非 JSON 布尔值 -> INVALID_BOOL。
+    """
+    try:
+        with open(file_path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        raise FlagError("IMPORT_READ_ERROR")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise FlagError("INVALID_JSON")
+    try:
+        data = json.loads(text, object_pairs_hook=_unique_object_pairs)
+    except FlagError:
+        raise
+    except ValueError:
+        raise FlagError("INVALID_JSON")
+    if not isinstance(data, dict):
+        raise FlagError("INVALID_JSON")
+    for key in data:
+        validate_key(key)
+    for value in data.values():
+        if not isinstance(value, bool):
+            raise FlagError("INVALID_BOOL")
+    return data
+
+
+def cmd_import(db_path, env, file_path):
+    """从 JSON 文件导入一个环境的直接设置，返回 {键名: 布尔值}。
+
+    导入覆盖目标环境中出现的同名键，保留其他环境和文件中未出现的
+    记录；false 是实际设置而非删除。空对象 {} 直接成功返回，不访问
+    数据库。非空导入沿用 set 的存储行为：创建缺失的数据库文件和
+    flags 表，但不创建父目录；父目录不存在、目标不是有效数据库、
+    flags 表缺少所需列或写入失败都报 STORAGE_ERROR，整个导入在
+    一个事务中完成，失败时既有记录保持原样。
+    """
+    data = load_import_file(file_path)
+    if not data:
+        return {}
+    conn = connect(db_path)
+    try:
+        with conn:
+            conn.execute(SCHEMA)
+            conn.executemany(
+                "INSERT OR REPLACE INTO flags (env, key, value) VALUES (?, ?, ?)",
+                [
+                    (env, key, "true" if data[key] else "false")
+                    for key in sorted(data)
+                ],
+            )
+    except sqlite3.Error:
+        raise FlagError("STORAGE_ERROR")
+    finally:
+        conn.close()
+    return data
+
+
 def cmd_envs(db_path):
     """列出库中至少有一个合法键直接设置的环境名，返回名称列表。
 
@@ -273,6 +350,10 @@ def build_parser():
 
     sub.add_parser("envs", help="列出库中已有直接设置的环境名")
 
+    p_import = sub.add_parser("import", help="从 JSON 文件导入环境的直接设置")
+    p_import.add_argument("env")
+    p_import.add_argument("file")
+
     return parser
 
 
@@ -298,6 +379,13 @@ def main(argv=None):
             if args.command == "list":
                 # list 只接收环境名，输出单行 JSON 对象，值为 JSON 布尔值。
                 result = json.dumps(cmd_list(args.db, env), sort_keys=True)
+            elif args.command == "import":
+                # import 接收环境名和 JSON 文件路径：环境名校验先于读文件，
+                # 文件与内容校验先于访问数据库；输出仅含本次导入项的
+                # 单行 JSON 对象。
+                result = json.dumps(
+                    cmd_import(args.db, env, args.file), sort_keys=True
+                )
             else:
                 validate_key(args.key)
                 if args.command == "set":
