@@ -102,6 +102,17 @@
   相同报 EXPORT_WRITE_ERROR，输出已存在报 EXPORT_EXISTS 且原内容
   保留，输出父目录缺失报 EXPORT_WRITE_ERROR 且不创建目录；成功与
   失败路径下源库字节均保持不变。
+* export 处理顺序（环境名 -> 完整读取配置 -> 输出文件）的组合回归：
+  固定样例 demo.sqlite（flags 表仅 dev/new_ui=yes 与 qa/new_ui=true）
+  与预先保存 UTF-8 文本 KEEP 的 out.json 同处一个已存在的临时目录，
+  多项错误同时存在时结果唯一——空字符串或仅含空格、制表符的环境名
+  只报 EMPTY_ENV；环境为 dev 时只报 STORAGE_ERROR，已存在的
+  out.json 不使结果变为 EXPORT_EXISTS；输出路径为 demo.sqlite
+  本身（含带 ./ 的等价写法）时仍只报 STORAGE_ERROR，不先报
+  EXPORT_WRITE_ERROR。每次失败退出 2、stdout 为空、stderr 严格为
+  错误码加换行；调用后源库字节与全部记录（yes 不被修正、true 原样
+  保留）、out.json 的 KEEP 与临时目录文件清单均不变，每个用例独立
+  准备样例。
 * export 在文件创建之后写入失败的文件保护：固定样例库 demo.sqlite
   （dev/new_ui=false、qa/new_ui=true）导出 dev 到起初不存在的
   dev.json，文件已创建但尚未写入内容与已写入部分内容后两种 OSError
@@ -3257,6 +3268,124 @@ class TestExport(FlagctlCliTestCase):
 
         with open(db, "rb") as fh:
             self.assertEqual(fh.read(), before)
+
+
+class TestExportErrorPrecedence(FlagctlCliTestCase):
+    """export 处理顺序（环境名 -> 完整读取配置 -> 输出文件）的组合回归。
+
+    固定样例：临时目录（数据库父目录）已经存在，demo.sqlite 是有效
+    SQLite 库，flags 表仅含 dev/new_ui=yes（非法存储值）与
+    qa/new_ui=true 两条记录，out.json 预先保存 UTF-8 文本 KEEP。
+    多项错误条件同时存在时，结果由处理顺序唯一决定：
+
+    * 环境名为空字符串或仅含空格、制表符 -> 只报 EMPTY_ENV，非法
+      存储值与已存在的 out.json 都不参与判定；
+    * 环境为 dev -> 只报 STORAGE_ERROR，已存在的 out.json 不能使
+      结果变为 EXPORT_EXISTS；
+    * 环境为 dev 且输出路径就是 demo.sqlite 本身（含带 ./ 的等价
+      写法）-> 仍只报 STORAGE_ERROR，不能先报 EXPORT_WRITE_ERROR。
+
+    每次失败退出 2、stdout 为空、stderr 严格为错误码加换行，不含
+    提示文本或部分 JSON；调用后源库文件字节与全部记录（dev 的 yes
+    不被修正、qa 的 true 原样保留）、out.json 的 KEEP 内容与临时
+    目录文件清单均保持不变。每个用例独立准备样例，互不以前序用例
+    的结果为前提；检查阶段只读取既有文件，不补建数据库或表。
+    """
+
+    FIXED_ROWS = [("dev", "new_ui", "yes"), ("qa", "new_ui", "true")]
+
+    def make_fixed_sample(self):
+        """独立准备固定样例，返回 (demo.sqlite 路径, out.json 路径)。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags (env TEXT NOT NULL, key TEXT NOT NULL, "
+                    "value TEXT NOT NULL, PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags VALUES (?, ?, ?)", self.FIXED_ROWS
+                )
+        finally:
+            conn.close()
+        out_path = os.path.join(self.tmpdir, "out.json")
+        with open(out_path, "wb") as fh:
+            fh.write("KEEP".encode("utf-8"))
+        return db, out_path
+
+    def snapshot_sample(self, db, out_path):
+        """采集调用前的现场：库字节、全部记录、out.json 字节、目录清单。"""
+        return (
+            self.read_file_bytes(db),
+            self.read_flags_rows(db),
+            self.read_file_bytes(out_path),
+            sorted(os.listdir(self.tmpdir)),
+        )
+
+    def assert_sample_unchanged(self, db, out_path, before):
+        """调用后现场与快照一致，且记录仍是固定样例原样。"""
+        db_bytes, rows, out_bytes, listing = before
+        self.assertEqual(rows, self.FIXED_ROWS, "样例准备后记录即应为固定内容")
+        self.assertEqual(
+            self.read_file_bytes(db), db_bytes, "源库文件字节必须保持不变"
+        )
+        self.assertEqual(
+            self.read_flags_rows(db),
+            self.FIXED_ROWS,
+            "dev 的 yes 不得被修正，qa 的 true 必须原样保留",
+        )
+        self.assertEqual(out_bytes, b"KEEP", "out.json 预先保存的内容应为 KEEP")
+        self.assertEqual(
+            self.read_file_bytes(out_path), out_bytes, "已有 out.json 内容必须保留"
+        )
+        self.assertEqual(
+            sorted(os.listdir(self.tmpdir)), listing, "临时目录不得新增文件"
+        )
+
+    def check_export_error_on_fixed_sample(self, env, code, output="out.json"):
+        """在独立准备的固定样例上导出，核对唯一错误码与调用后现场不变。
+
+        output 为 "out.json" 时输出到已存在的 out.json；为 "db" 时
+        输出到 demo.sqlite 本身；为 "./db" 时输出到带 ./ 的等价路径。
+        """
+        db, out_path = self.make_fixed_sample()
+        if output == "db":
+            target = db
+        elif output == "./db":
+            target = os.path.join(os.path.dirname(db), ".", os.path.basename(db))
+        else:
+            target = out_path
+        before = self.snapshot_sample(db, out_path)
+
+        self.assertCommandError(self.export_flags(db, env, target), code)
+
+        self.assert_sample_unchanged(db, out_path, before)
+
+    def test_empty_env_reports_only_empty_env(self):
+        self.check_export_error_on_fixed_sample("", "EMPTY_ENV")
+
+    def test_spaces_only_env_reports_only_empty_env(self):
+        self.check_export_error_on_fixed_sample("   ", "EMPTY_ENV")
+
+    def test_tab_only_env_reports_only_empty_env(self):
+        self.check_export_error_on_fixed_sample("\t", "EMPTY_ENV")
+
+    def test_invalid_value_reports_storage_error_not_export_exists(self):
+        # 目标环境合法键存有非法值且 out.json 已存在：完整读取配置
+        # 先于输出文件检查，结果只能是 STORAGE_ERROR。
+        self.check_export_error_on_fixed_sample("dev", "STORAGE_ERROR")
+
+    def test_output_same_as_db_reports_storage_error_not_write_error(self):
+        # 输出路径与库路径相同且目标环境存有非法值：读取配置先于
+        # 输出路径检查，不能先报 EXPORT_WRITE_ERROR。
+        self.check_export_error_on_fixed_sample("dev", "STORAGE_ERROR", output="db")
+
+    def test_output_same_as_db_dot_prefix_reports_storage_error(self):
+        # 带 ./ 的等价同库路径同样只报 STORAGE_ERROR。
+        self.check_export_error_on_fixed_sample(
+            "dev", "STORAGE_ERROR", output="./db"
+        )
 
 
 class TestExportWriteFailureCleanup(FlagctlCliTestCase):
