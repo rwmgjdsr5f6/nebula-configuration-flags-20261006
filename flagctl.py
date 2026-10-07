@@ -4,7 +4,7 @@
 用法:
     python flagctl.py --db <数据库文件> set <环境名> <键名> <true|false> [--dry-run]
     python flagctl.py --db <数据库文件> get <环境名> <键名>
-    python flagctl.py --db <数据库文件> unset <环境名> <键名>
+    python flagctl.py --db <数据库文件> unset <环境名> <键名> [--dry-run]
     python flagctl.py --db <数据库文件> list <环境名>
     python flagctl.py --db <数据库文件> diff <环境名左> <环境名右>
     python flagctl.py --db <数据库文件> envs
@@ -189,11 +189,43 @@ def cmd_get(db_path, env, key):
     return stored_bool_text(row[0])
 
 
-def cmd_unset(db_path, env, key):
+def preview_unset(db_path, env, key):
+    """只读预览撤销一个直接设置将带来的变化。
+
+    返回 {键名: {"before": JSON 布尔值, "after": None}}，after 为 None
+    （null）表示撤销后该 (env, key) 行不存在，不补默认值或继承值。
+    存储分类与值校验与 cmd_get 完全一致：库文件缺失但父目录存在、
+    有效库缺 flags 表或目标记录缺失时报 VALUE_NOT_SET；父目录缺失、
+    无效库、读取所需列缺失、连接或查询失败、目标记录值不是严格文本
+    true/false 时报 STORAGE_ERROR。原值 false 同样输出变化，不视为
+    未设置；其他环境及未知键记录的异常值不影响预览。纯只读，不创建
+    目录、库文件或表，不改动任何记录或修复异常值。
+    """
+    before = cmd_get(db_path, env, key) == "true"
+    return {key: {"before": before, "after": None}}
+
+
+def cmd_unset(db_path, env, key, dry_run=False):
+    """删除目标 (环境, 键) 的整行直接设置，成功时返回 "unset"。
+
+    不补建 flags 表：缺表与没有目标记录一样视为值未设置（由
+    open_flag_store 统一分类）。直接按主键删除，以 rowcount 是否
+    为 0 区分记录是否存在，无论原值是 true、false 还是异常值都删除
+    该行；rowcount 为 0（含库文件或 flags 表缺失）报 VALUE_NOT_SET。
+
+    dry_run=True 时完全不删除，改为只读预览单键变化，输出只含该键
+    的 {"before": 原布尔值, "after": null}；与正式 unset 不同，预览
+    要求目标行原值必须是严格文本 true/false（非法值报 STORAGE_ERROR），
+    目标行不存在报 VALUE_NOT_SET。输入校验顺序、错误码与正式 unset
+    一致，全程不创建或改动任何存储对象。
+    """
+    if dry_run:
+        return preview_unset(db_path, env, key)
     with open_flag_store(db_path) as conn:
         # 不补建 flags 表：缺表与没有目标记录一样视为值未设置（由
         # open_flag_store 统一分类）。直接按主键删除，以 rowcount 是否
-        # 为 0 区分记录是否存在，无论原值是 true 还是 false 都删除该行。
+        # 为 0 区分记录是否存在，无论原值是 true、false 还是异常文本都
+        # 删除该行（正式 unset 不校验原值）。
         with conn:
             cur = conn.execute(
                 "DELETE FROM flags WHERE env = ? AND key = ?", (env, key)
@@ -478,6 +510,11 @@ def build_parser():
     p_unset = sub.add_parser("unset", help="撤销开关的直接设置")
     p_unset.add_argument("env")
     p_unset.add_argument("key")
+    p_unset.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只预览撤销该键将发生的变化，不删除记录",
+    )
 
     p_list = sub.add_parser("list", help="列出环境已保存的开关")
     p_list.add_argument("env")
@@ -564,7 +601,17 @@ def main(argv=None):
                     else:
                         result = cmd_set(args.db, env, args.key, value)
                 elif args.command == "unset":
-                    result = cmd_unset(args.db, env, args.key)
+                    if args.dry_run:
+                        # unset --dry-run 与 set/import --dry-run 同为紧凑
+                        # 变化对象，内层固定先 before 后 after；不用
+                        # sort_keys，以免调换两个字段的顺序。紧凑分隔符，
+                        # 输出 {"key":{"before":..,"after":null}}。
+                        result = json.dumps(
+                            cmd_unset(args.db, env, args.key, True),
+                            separators=(",", ":"),
+                        )
+                    else:
+                        result = cmd_unset(args.db, env, args.key)
                 else:
                     result = cmd_get(args.db, env, args.key)
     except FlagError as exc:

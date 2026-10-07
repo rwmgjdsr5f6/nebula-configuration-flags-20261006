@@ -22,6 +22,21 @@
 * unset 在五种数据库状态下的行为：文件缺失、有效库缺 flags 表、表内
   无目标记录（VALUE_NOT_SET），父目录不存在、目标为普通文本文件
   （STORAGE_ERROR），且调用前后相关数据与文件状态保持不变；
+* unset --dry-run 只读预览撤销直接设置的变化：固定样例 demo.sqlite
+  中 dev/new_ui=false、qa/new_ui=true，unset dev new_ui --dry-run 的
+  stdout 为单行 {"new_ui":{"before":false,"after":null}} 加换行，
+  退出 0、stderr 为空，随后 get dev new_ui 仍输出 false、qa 仍为
+  true；原值 true 同样预览为 before=true、after=null，false 不被当成
+  未设置；目标行不存在、父目录存在而库文件缺失或有效库没有 flags
+  表时报 VALUE_NOT_SET，父目录不存在、普通文本文件、flags 表缺
+  value 列或目标 new_ui 的存储文本不是严格 true/false 时报
+  STORAGE_ERROR、保留原值、不输出部分结果，其他环境或未知键的异常
+  值不影响合法目标预览；环境名两端空白被去除、内部空白保留、大小
+  写敏感，键名不去空白、不转换大小写；每次预览前后库文件字节、
+  完整记录与表结构均保持一致，重复预览结果相同，不接收布尔值参数；
+  不带该选项的 unset 仍删除整行并回显 unset（原值非法也照常删除），
+  重复删除报 VALUE_NOT_SET；所有失败均退出 2、stdout 为空、stderr
+  仅为错误码加换行；
 * get 的 EMPTY_ENV / UNKNOWN_KEY 拒绝顺序：键名不去空白、不转换大小写，
   校验失败不创建数据库文件或目录、不新增表或记录、不改变既有记录，
   父目录不存在时错误优先级不变（不降级为 STORAGE_ERROR）；
@@ -203,6 +218,10 @@ class FlagctlCliTestCase(unittest.TestCase):
 
     def unset_flag(self, db, env, key):
         return self.run_flagctl(db, "unset", env, key)
+
+    def unset_preview(self, db, env, key):
+        """在全新进程中执行 unset <env> <key> --dry-run。"""
+        return self.run_flagctl(db, "unset", env, key, "--dry-run")
 
     def list_flags(self, db, env):
         return self.run_flagctl(db, "list", env)
@@ -971,6 +990,422 @@ class TestUnsetStorageStates(FlagctlCliTestCase):
 
         with open(db, "r", encoding="utf-8") as fh:
             self.assertEqual(fh.read(), content)
+
+
+class TestUnsetDryRunPreview(FlagctlCliTestCase):
+    """unset --dry-run 只读预览撤销变化的命令行回归测试。
+
+    主验收样例固定为 demo.sqlite 中 dev/new_ui=false、qa/new_ui=true：
+    unset dev new_ui --dry-run 的 stdout 为单行紧凑 JSON 对象
+    {"new_ui":{"before":false,"after":null}} 加换行，退出 0、stderr
+    为空，随后 get dev new_ui 仍输出 false、qa 仍为 true。原值 true
+    同样预览为 before=true、after=null，false 是有效设置而非未设置。
+    另覆盖目标行缺失、库文件缺失（父目录存在）与有效库缺 flags 表报
+    VALUE_NOT_SET；父目录缺失、普通文本文件、flags 表缺 value 列或
+    目标值不是严格文本 true/false 报 STORAGE_ERROR 且不输出部分结果；
+    其他环境与未知键记录的异常值不影响预览；环境名去两端空白、保留
+    内部空白并区分大小写，键名不去空白、不转换大小写；重复预览结果
+    相同，预览不接收布尔值位置参数；不带 --dry-run 的 unset 仍删除
+    整行（原值非法也照常删除）并回显 unset，重复删除报
+    VALUE_NOT_SET。每次预览前后都核对库文件字节、表结构与完整记录；
+    失败一律退出 2、stdout 为空、stderr 仅为错误码加换行。
+    """
+
+    def make_demo_db(self):
+        """固定主验收样例库 demo.sqlite：dev/new_ui=false、qa/new_ui=true。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+        return db
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
+    def snapshot_storage(self, db):
+        """采集库文件存在性、字节、表清单及 flags 表结构与完整记录。"""
+        snapshot = {"exists": os.path.exists(db)}
+        if snapshot["exists"]:
+            snapshot["bytes"] = self.read_file_bytes(db)
+            conn = sqlite3.connect(db)
+            try:
+                tables = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' "
+                        "ORDER BY name"
+                    ).fetchall()
+                ]
+                snapshot["tables"] = tables
+                if "flags" in tables:
+                    snapshot["columns"] = [
+                        row[1]
+                        for row in conn.execute("PRAGMA table_info(flags)").fetchall()
+                    ]
+                    snapshot["rows"] = conn.execute(
+                        "SELECT env, key, value FROM flags ORDER BY env, key"
+                    ).fetchall()
+                else:
+                    snapshot["columns"] = None
+                    snapshot["rows"] = None
+            finally:
+                conn.close()
+        return snapshot
+
+    def assert_storage_snapshot_unchanged(self, db, before):
+        """调用后的存储现场（文件字节、表结构、完整记录）必须与快照一致。"""
+        self.assertEqual(self.snapshot_storage(db), before)
+
+    def test_fixed_sample_dev_false_previews_deletion_without_writing(self):
+        # 主验收样例：dev/new_ui=false 预览撤销，stdout 严格为单行紧凑
+        # JSON 对象 {"new_ui":{"before":false,"after":null}} 加换行；
+        # 预览不删除任何行，get dev new_ui 仍输出 false，qa 的 true 保留。
+        db = self.make_demo_db()
+
+        before = self.snapshot_storage(db)
+        proc = self.unset_preview(db, "dev", "new_ui")
+
+        self.assertCommandOk(proc, '{"new_ui":{"before":false,"after":null}}')
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+    def test_true_value_previews_true_before_null_after(self):
+        # 原值 true 同样输出变化：before 为 JSON 布尔 true、after 为 null。
+        db = self.make_demo_db()
+
+        before = self.snapshot_storage(db)
+        proc = self.unset_preview(db, "qa", "new_ui")
+
+        self.assertCommandOk(proc, '{"new_ui":{"before":true,"after":null}}')
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+    def test_missing_row_reports_value_not_set(self):
+        # flags 表只有 qa/new_ui=true：预览撤销 dev 报 VALUE_NOT_SET，
+        # 不输出部分结果，qa 记录保持不变，也不新增 dev 记录。
+        db = self.db_path("unset_preview_only_qa_row")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+
+        before = self.snapshot_storage(db)
+        proc = self.unset_preview(db, "dev", "new_ui")
+
+        self.assertCommandError(proc, "VALUE_NOT_SET")
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "true")])
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+    def test_missing_db_file_reports_value_not_set_without_creating_file(self):
+        # 父目录存在而库文件缺失：报 VALUE_NOT_SET，退出 2、stdout 为空，
+        # 不补建库文件，临时目录内文件清单不变。
+        db = self.db_path("unset_preview_missing_db")
+        self.assertFalse(os.path.exists(db))
+        listing_before = sorted(os.listdir(self.tmpdir))
+
+        proc = self.unset_preview(db, "dev", "new_ui")
+
+        self.assertCommandError(proc, "VALUE_NOT_SET")
+        self.assertFalse(os.path.exists(db), "预览不得补建数据库文件: %s" % db)
+        self.assertEqual(
+            sorted(os.listdir(self.tmpdir)),
+            listing_before,
+            "预览不得在临时目录内新增任何文件",
+        )
+
+    def test_valid_db_without_flags_table_reports_value_not_set(self):
+        # 有效 SQLite 库只含无关表 notes：预览撤销报 VALUE_NOT_SET，
+        # 不补建 flags 表，原有表与其数据、库文件字节均保持不变。
+        db = self.db_path("unset_preview_no_flags_table")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+                )
+                conn.execute("INSERT INTO notes (text) VALUES ('sample note')")
+        finally:
+            conn.close()
+        self.assertEqual(self.read_table_names(db), ["notes"])
+
+        before = self.snapshot_storage(db)
+        proc = self.unset_preview(db, "dev", "new_ui")
+
+        self.assertCommandError(proc, "VALUE_NOT_SET")
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(self.read_table_names(db), ["notes"])
+        conn = sqlite3.connect(db)
+        try:
+            notes = conn.execute("SELECT id, text FROM notes").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(notes, [(1, "sample note")])
+
+    def test_corrupt_target_value_reports_storage_error_without_partial_output(self):
+        # 目标 new_ui 的存储文本为 TRUE（不是严格文本 true/false）：预览
+        # 报 STORAGE_ERROR，不输出 {"before":..,"after":null} 之类的部分
+        # 结果，异常原值原样保留，库文件字节、完整记录与表结构不变。
+        db = self.db_path("unset_preview_bad_target")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "TRUE"), ("qa", "new_ui", "true")],
+        )
+
+        before = self.snapshot_storage(db)
+        proc = self.unset_preview(db, "dev", "new_ui")
+
+        self.assertCommandError(proc, "STORAGE_ERROR")
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "TRUE"), ("qa", "new_ui", "true")],
+        )
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "STORAGE_ERROR")
+        # qa 的合法 true 预览不受影响。
+        self.assertCommandOk(
+            self.unset_preview(db, "qa", "new_ui"),
+            '{"new_ui":{"before":true,"after":null}}',
+        )
+        self.assert_storage_snapshot_unchanged(db, before)
+
+    def test_invalid_value_in_other_env_does_not_affect_preview(self):
+        # 其他环境的异常值不在目标范围内：qa/new_ui=yes 不影响 dev 的
+        # 合法预览，预览后异常原值原样保留。
+        db = self.db_path("unset_preview_other_env_bad")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "yes")],
+        )
+
+        before = self.snapshot_storage(db)
+        proc = self.unset_preview(db, "dev", "new_ui")
+
+        self.assertCommandOk(proc, '{"new_ui":{"before":true,"after":null}}')
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "yes")],
+        )
+
+    def test_unknown_key_rows_do_not_affect_preview(self):
+        # 未知键（含其异常值，无论是否在目标环境内）一律忽略：合法目标
+        # dev/new_ui=true 的预览正常输出，未知键异常行原样保留。
+        db = self.db_path("unset_preview_unknown_key_bad")
+        self.seed_flags_table(
+            db,
+            [
+                ("dev", "new_ui", "true"),
+                ("dev", "other_key", "yes"),
+                ("qa", "other_key", "maybe"),
+            ],
+        )
+
+        before = self.snapshot_storage(db)
+        proc = self.unset_preview(db, "dev", "new_ui")
+
+        self.assertCommandOk(proc, '{"new_ui":{"before":true,"after":null}}')
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [
+                ("dev", "new_ui", "true"),
+                ("dev", "other_key", "yes"),
+                ("qa", "other_key", "maybe"),
+            ],
+        )
+
+    def test_storage_error_states_keep_storage_untouched(self):
+        # 父目录不存在、目标为普通文本文件、flags 表缺 value 列三种状态
+        # 下，合法输入的预览都报 STORAGE_ERROR，不创建或改动任何对象。
+        missing_dir = os.path.join(self.tmpdir, "unset_preview_no_such_dir")
+        missing_db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+        proc = self.unset_preview(missing_db, "dev", "new_ui")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(missing_db), "不得创建数据库文件")
+
+        text_db = self.db_path("unset_preview_plain_text")
+        content = b"this is not a sqlite database\n"
+        with open(text_db, "wb") as fh:
+            fh.write(content)
+        proc = self.unset_preview(text_db, "dev", "new_ui")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+        self.assertEqual(self.read_file_bytes(text_db), content)
+
+        no_column_db = self.db_path("unset_preview_no_value_column")
+        conn = sqlite3.connect(no_column_db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.execute(
+                    "INSERT INTO flags (env, key) VALUES (?, ?)",
+                    ("dev", "new_ui"),
+                )
+        finally:
+            conn.close()
+        proc = self.unset_preview(no_column_db, "dev", "new_ui")
+        self.assertCommandError(proc, "STORAGE_ERROR")
+        self.assertEqual(self.read_flags_columns(no_column_db), ["env", "key"])
+        self.assertEqual(
+            self.read_flags_env_key_rows(no_column_db), [("dev", "new_ui")]
+        )
+
+    def test_env_validation_before_storage(self):
+        # 空或全空白环境名先报 EMPTY_ENV，即使父目录缺失也不降级为
+        # STORAGE_ERROR，且不创建目录或文件；已有库的记录保持不变。
+        missing_dir = os.path.join(self.tmpdir, "unset_preview_empty_dir")
+        missing_db = os.path.join(missing_dir, "flags.sqlite")
+        for env in ("", "   "):
+            proc = self.unset_preview(missing_db, env, "new_ui")
+            self.assertCommandError(proc, "EMPTY_ENV")
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(missing_db), "不得创建数据库文件")
+
+        db = self.make_demo_db()
+        before = self.snapshot_storage(db)
+        self.assertCommandError(self.unset_preview(db, "  ", "new_ui"), "EMPTY_ENV")
+        self.assert_storage_snapshot_unchanged(db, before)
+
+    def test_key_validation_before_storage(self):
+        # 未知键先报 UNKNOWN_KEY（即使父目录缺失也不降级），键名不去除
+        # 空白、不转换大小写；校验失败不创建任何对象、不改动既有记录。
+        missing_dir = os.path.join(self.tmpdir, "unset_preview_bad_key_dir")
+        missing_db = os.path.join(missing_dir, "flags.sqlite")
+        for key in ("other_key", " new_ui ", "NEW_UI"):
+            proc = self.unset_preview(missing_db, "dev", key)
+            self.assertCommandError(proc, "UNKNOWN_KEY")
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(missing_db), "不得创建数据库文件")
+
+        db = self.make_demo_db()
+        before = self.snapshot_storage(db)
+        for key in (" new_ui ", "NEW_UI"):
+            self.assertCommandError(self.unset_preview(db, "dev", key), "UNKNOWN_KEY")
+        self.assert_storage_snapshot_unchanged(db, before)
+
+    def test_empty_env_takes_precedence_over_unknown_key(self):
+        # 环境名与键同时不合法：先报告 EMPTY_ENV，且不访问存储。
+        db = self.db_path("unset_preview_order")
+        self.assertFalse(os.path.exists(db))
+        self.assertCommandError(
+            self.unset_preview(db, "", "bad_key"), "EMPTY_ENV"
+        )
+        self.assertFalse(os.path.exists(db), "校验失败不得创建数据库文件")
+
+    def test_env_name_trims_edges_preserves_internal_space_and_case(self):
+        # 环境名两端空白被去除、内部空白保留且区分大小写：" Dev " 命中
+        # 已保存的 Dev 记录；"dev"、"De v" 是不同环境，后者无记录报
+        # VALUE_NOT_SET。预览全程不写入。
+        db = self.make_demo_db()
+        self.assertCommandOk(self.set_flag(db, "Dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "De v", "new_ui", "true"), "true")
+
+        before = self.snapshot_storage(db)
+        self.assertCommandOk(
+            self.unset_preview(db, " Dev ", "new_ui"),
+            '{"new_ui":{"before":true,"after":null}}',
+        )
+        # "dev" 是小写记录（false），与 "Dev" 区分；"De v" 含内部空白。
+        self.assertCommandOk(
+            self.unset_preview(db, "dev", "new_ui"),
+            '{"new_ui":{"before":false,"after":null}}',
+        )
+        self.assertCommandOk(
+            self.unset_preview(db, "  De v  ", "new_ui"),
+            '{"new_ui":{"before":true,"after":null}}',
+        )
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertCommandOk(self.get_flag(db, "Dev", "new_ui"), "true")
+        self.assertCommandOk(self.get_flag(db, "De v", "new_ui"), "true")
+
+    def test_repeated_previews_are_identical_and_never_write(self):
+        # 连续两次预览结果逐字节相同，库现场保持不变；预览不会因重复
+        # 调用而删除记录。
+        db = self.make_demo_db()
+        before = self.snapshot_storage(db)
+
+        for _ in range(2):
+            proc = self.unset_preview(db, "dev", "new_ui")
+            self.assertCommandOk(proc, '{"new_ui":{"before":false,"after":null}}')
+            self.assert_storage_snapshot_unchanged(db, before)
+
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+
+    def test_preview_rejects_bool_positional_argument(self):
+        # 预览不接收布尔值参数：多给一个位置参数由 argparse 拒绝，
+        # 退出码为 argparse 默认的 2，stdout 为空、stderr 为用法错误，
+        # 库文件不被创建。
+        db = self.db_path("unset_extra_arg")
+        self.assertFalse(os.path.exists(db))
+        proc = self.run_flagctl(db, "unset", "dev", "new_ui", "false", "--dry-run")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("unrecognized arguments", proc.stderr)
+        self.assertFalse(os.path.exists(db), "参数解析失败不得创建数据库文件")
+
+    def test_normal_unset_still_deletes_whole_row(self):
+        # 不带 --dry-run 的 unset 行为不变：删除整行并回显 unset；
+        # 随后 get 报 VALUE_NOT_SET，qa 不受影响。
+        db = self.make_demo_db()
+
+        removed = self.unset_flag(db, "dev", "new_ui")
+        self.assertCommandOk(removed, "unset")
+        self.assertEqual(
+            self.read_flags_rows(db), [("qa", "new_ui", "true")]
+        )
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+        # 重复删除报 VALUE_NOT_SET，不重新创建记录。
+        self.assertCommandError(
+            self.unset_flag(db, "dev", "new_ui"), "VALUE_NOT_SET"
+        )
+        self.assertEqual(
+            self.read_flags_rows(db), [("qa", "new_ui", "true")]
+        )
+
+    def test_normal_unset_deletes_illegal_value_row_but_preview_does_not(self):
+        # 对照：预览对非法原值报 STORAGE_ERROR 且保留异常行；正式 unset
+        # 不校验原值，照常删除整行，重复删除再报 VALUE_NOT_SET。
+        db = self.db_path("unset_preview_then_real_bad_value")
+        self.seed_flags_table(db, [("dev", "new_ui", "garbage")])
+
+        before = self.snapshot_storage(db)
+        self.assertCommandError(self.unset_preview(db, "dev", "new_ui"), "STORAGE_ERROR")
+        self.assert_storage_snapshot_unchanged(db, before)
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "garbage")])
+
+        self.assertCommandOk(self.unset_flag(db, "dev", "new_ui"), "unset")
+        self.assertEqual(self.read_flags_rows(db), [])
+        self.assertCommandError(
+            self.unset_flag(db, "dev", "new_ui"), "VALUE_NOT_SET"
+        )
 
 
 class TestSetStorageStates(FlagctlCliTestCase):
