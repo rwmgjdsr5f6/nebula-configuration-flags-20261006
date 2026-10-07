@@ -49,6 +49,7 @@ stderr 均为空。
     python flagctl.py --db <库> diff <环境左> <环境右>
     python flagctl.py --db <库> envs
     python flagctl.py --db <库> import <环境> <JSON 文件>
+    python flagctl.py --db <库> export <环境> <JSON 文件>
 
 - **set**：保存或覆盖一个直接设置，成功时 stdout 回显所写入的
   `true` / `false`。
@@ -76,6 +77,13 @@ stderr 均为空。
   不代表删除。成功时 stdout 为仅含本次导入项的单行 JSON 对象；
   空对象 `{}` 直接成功返回 `{}`，不访问数据库。非空导入沿用 set
   的存储行为：创建缺失的数据库文件和 flags 表，但不创建父目录。
+- **export**：把目标环境已保存的合法键直接设置导出为 JSON 文件。
+  文件为无 BOM 的 UTF-8，内容是单行 JSON 对象加换行，与 list 的
+  输出一致（只含目标环境已保存的已知键，值为 JSON 布尔值，`false`
+  原样保留，未设置的键不出现）；成功时 stdout 为同一 JSON 对象。
+  库文件缺失（父目录存在）、有效库缺 flags 表或环境无合法设置时
+  导出 `{}`，不创建数据库或表。输出路径已存在时报 EXPORT_EXISTS
+  并保留原内容；导出全程不改动源库。
 
 关于“直接设置为 false”与“未设置（null）”的区别，以及 unset、diff
 在这条流程上的完整行为，见 [direct-setting.txt](direct-setting.txt)。
@@ -105,14 +113,15 @@ stderr 均为空。
 - 同一 (env, key) 再次 set 会覆盖旧行（INSERT OR REPLACE）；
 - **set 首次写入时**（以及非空 import 首次导入时）会创建缺失的
   数据库文件并用 `CREATE TABLE IF NOT EXISTS` 建表；
-- **get、unset、list、diff、envs 不补建任何文件或表**：库文件不存在
-  或缺 flags 表时按下文的错误/空结果规则处理。
+- **get、unset、list、diff、envs、export 不补建任何文件或表**：库文件
+  不存在或缺 flags 表时按下文的错误/空结果规则处理。
 
 ## 输出协议
 
 - **成功**：退出码 0；stderr 为空；stdout 为单行结果加换行。
-  set/get 输出布尔文本，unset 输出 `unset`，list/diff 输出一行
-  JSON 对象，envs 输出一行 JSON 数组。
+  set/get 输出布尔文本，unset 输出 `unset`，list/diff/export 输出
+  一行 JSON 对象（export 的输出与导出文件内容相同），envs 输出一行
+  JSON 数组。
 - **失败**：退出码 2；stdout 为空；stderr 仅为错误码加换行，
   例如 `VALUE_NOT_SET`，不附带其他文本。
 
@@ -126,6 +135,11 @@ stderr 均为空。
 - **INVALID_BOOL**：set 给出的值不是严格小写的 `true` / `false`；
   或 import 文件中的值不是 JSON 布尔值（如 `"false"`、`1`、`null`）。
 - **IMPORT_READ_ERROR**：import 的文件不存在或无法读取。
+- **EXPORT_EXISTS**：export 的输出路径已存在；原内容保留，不会
+  被覆盖。
+- **EXPORT_WRITE_ERROR**：export 的输出路径与数据库路径的规范化
+  绝对路径相同；或输出父目录缺失、无法写入、写入失败。不创建目录，
+  失败时不遗留本次新产生的残缺文件。
 - **INVALID_JSON**：import 的文件不是合法 UTF-8、JSON 语法错误、
   顶层不是对象或存在重复键。未加引号的 `NaN`、`Infinity`、
   `-Infinity` 不是合法 JSON 词法（出现在任意嵌套位置都算语法错误，
@@ -134,9 +148,9 @@ stderr 均为空。
   记录。父目录存在但数据库文件缺失、或文件是有效 SQLite 库但缺少
   flags 表时，也按此处理——查询不会顺手补建文件或表。
 - **STORAGE_ERROR**：父目录不存在；目标文件不是有效的 SQLite 数据库；
-  操作所需的表列缺失；以及 get、list、diff、envs 在目标范围内读到
-  已知键保存了 `true` / `false` 之外的非法值（数据损坏）。envs 的
-  目标范围是全库：库中任一合法键的值非法都报此错，不输出部分名单。
+  操作所需的表列缺失；以及 get、list、diff、envs、export 在目标范围
+  内读到已知键保存了 `true` / `false` 之外的非法值（数据损坏）。envs
+  的目标范围是全库：库中任一合法键的值非法都报此错，不输出部分名单。
 
 校验顺序与副作用：
 
@@ -156,6 +170,12 @@ stderr 均为空。
 - diff 的两侧各自按 list 的规则处理：两侧均无设置时输出 `{}`；任一
   目标环境中的已知键存在非法存储值则报 STORAGE_ERROR，不输出部分
   差异。其他环境以及未知键的记录不在目标范围内，其内容不影响结果。
+- export 严格按 **环境名 → 完整读取配置 → 处理输出文件** 的顺序
+  执行：读取规则与 list 相同（库文件缺失、有效库缺 flags 表或环境
+  无合法设置都导出 `{}`，不创建数据库或表）；读取完成后，输出路径
+  与数据库路径相同先报 EXPORT_WRITE_ERROR，输出已存在再报
+  EXPORT_EXISTS，其余写入失败报 EXPORT_WRITE_ERROR；任何失败都不
+  创建或改动输出文件，导出全程不改动源库。
 
 ## 当前不提供的能力
 

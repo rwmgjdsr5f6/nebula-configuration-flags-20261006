@@ -52,6 +52,17 @@
   目标为普通文本文件两种异常存储路径下依旧退出 0、stdout 严格为
   {} 且不创建目录或改动文件字节，同一库路径上的非空导入对照报
   STORAGE_ERROR 且现场保持不变。
+* export 把目标环境已保存的合法键直接设置导出为 JSON 文件：固定
+  样例 dev/new_ui=false、qa/new_ui=true 导出 dev 得到
+  {"new_ui":false}，stdout 与文件内容一致（无 BOM 的 UTF-8 单行
+  JSON 加换行），再 import 到另一库的 review 环境完成往返；环境名
+  -> 读配置 -> 输出文件的校验顺序（EMPTY_ENV 最先）；库文件缺失、
+  有效库缺 flags 表或环境无记录导出 {} 且不创建数据库或表；父目录
+  缺失、普通文本文件、flags 表缺列或目标环境存非法值报
+  STORAGE_ERROR；未知键与其他环境的异常值不影响导出；输出路径与
+  数据库路径相同报 EXPORT_WRITE_ERROR，输出已存在报 EXPORT_EXISTS
+  且原内容保留，输出父目录缺失报 EXPORT_WRITE_ERROR 且不创建目录；
+  导出全程不改动源库。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
 每个用例使用独立的临时目录，结束后自动清理，只依赖 Python 3 标准库。
@@ -114,6 +125,9 @@ class FlagctlCliTestCase(unittest.TestCase):
 
     def import_flags(self, db, env, file_path):
         return self.run_flagctl(db, "import", env, file_path)
+
+    def export_flags(self, db, env, file_path):
+        return self.run_flagctl(db, "export", env, file_path)
 
     def write_import_file(self, content, name="settings.json", raw=False):
         """在临时目录写入导入文件并返回路径；raw=True 时 content 为字节。"""
@@ -2255,6 +2269,285 @@ class TestImportEmptyObjectAbnormalStorage(FlagctlCliTestCase):
             "broken: 非空导入失败后文件字节必须保持不变，实际: %r"
             % after_nonempty,
         )
+
+
+class TestExport(FlagctlCliTestCase):
+    """export 把目标环境已保存的合法键直接设置导出为 JSON 文件。
+
+    输出协议：成功时退出 0、stderr 为空、stdout 为单行 JSON 对象加
+    换行，且与输出文件内容（无 BOM 的 UTF-8，单行 JSON 加换行）
+    完全一致；失败时退出 2、stdout 为空、stderr 仅为错误码加换行，
+    不创建或改动输出文件。校验顺序为环境名 -> 完整读取配置 ->
+    处理输出文件；读取规则与 list 相同（只含目标环境已保存的已知
+    键，false 原样保留，未设置的键不出现），全程不改动源库。
+    """
+
+    def assertExportOk(self, proc, path, expected):
+        """退出 0、stderr 为空、stdout 单行 JSON 解析为 expected，
+        且输出文件字节与 stdout 完全相同（无 BOM、单行加换行）。"""
+        self.assertEqual(
+            proc.returncode, 0, "期望退出码 0，实际 stderr: %r" % proc.stderr
+        )
+        self.assertEqual(proc.stderr, "")
+        self.assertTrue(proc.stdout.endswith("\n"), "输出必须以换行结束")
+        body = proc.stdout[:-1]
+        self.assertNotIn("\n", body, "JSON 输出必须只有一行")
+        self.assertEqual(json.loads(body), expected)
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), "文件不得带 BOM")
+        self.assertEqual(raw.decode("utf-8"), proc.stdout)
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
+    def test_fixed_sample_export_then_import_roundtrip(self):
+        # 固定验收样例：demo.sqlite 中 dev/new_ui=false、qa/new_ui=true，
+        # dev.json 不存在。export dev dev.json 后文件与 stdout 同为
+        # {"new_ui":false}（JSON 空格不影响验收），退出 0、stderr 为空；
+        # 再 import 到 copy.sqlite 的 review，review/new_ui 为 false，
+        # 源库记录保持原样。
+        db = self.db_path("demo")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        out = os.path.join(self.tmpdir, "dev.json")
+        self.assertFalse(os.path.exists(out))
+
+        self.assertExportOk(self.export_flags(db, "dev", out), out, {"new_ui": False})
+
+        copy_db = self.db_path("copy")
+        proc = self.import_flags(copy_db, "review", out)
+        self.assertEqual(proc.returncode, 0, "导入应成功，stderr: %r" % proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), {"new_ui": False})
+        self.assertCommandOk(self.get_flag(copy_db, "review", "new_ui"), "false")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+
+    def test_repeat_export_reports_export_exists_and_keeps_content(self):
+        # 重复导出到已存在的 dev.json：报 EXPORT_EXISTS，原内容逐字节保留。
+        db = self.db_path("export_exists")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        out = os.path.join(self.tmpdir, "dev.json")
+        self.assertExportOk(self.export_flags(db, "dev", out), out, {"new_ui": False})
+        with open(out, "rb") as fh:
+            before = fh.read()
+
+        self.assertCommandError(self.export_flags(db, "dev", out), "EXPORT_EXISTS")
+
+        with open(out, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_empty_env_rejected_before_storage_and_file(self):
+        # 空或全空白环境名报 EMPTY_ENV：即使数据库父目录不存在也先报
+        # 该错误，不创建目录、数据库或输出文件。
+        missing_dir = os.path.join(self.tmpdir, "export_no_such_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        out = os.path.join(self.tmpdir, "empty_env.json")
+        self.assertFalse(os.path.exists(missing_dir))
+
+        for env in ["", "   "]:
+            with self.subTest(env=env):
+                self.assertCommandError(self.export_flags(db, env, out), "EMPTY_ENV")
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+        self.assertFalse(os.path.exists(out), "不得创建输出文件")
+
+    def test_env_surrounding_whitespace_matches_stripped(self):
+        # 带两端空白的环境名命中去除空白后的同一环境。
+        db = self.db_path("export_whitespace")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        out = os.path.join(self.tmpdir, "ws.json")
+
+        self.assertExportOk(self.export_flags(db, "  dev  ", out), out, {"new_ui": True})
+
+    def test_missing_db_exports_empty_object_without_creating_db(self):
+        # 父目录存在但数据库文件缺失：导出 {}，不创建数据库文件。
+        db = self.db_path("export_missing")
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(db))
+        out = os.path.join(self.tmpdir, "missing.json")
+
+        self.assertExportOk(self.export_flags(db, "dev", out), out, {})
+
+        self.assertFalse(os.path.exists(db), "export 不得创建数据库文件: %s" % db)
+
+    def test_valid_db_without_flags_table_exports_empty_object(self):
+        # 有效库缺少 flags 表：导出 {}，不补建表，原有表与数据不变。
+        db = self.db_path("export_no_flags_table")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+                )
+                conn.execute("INSERT INTO notes (text) VALUES ('sample note')")
+        finally:
+            conn.close()
+        out = os.path.join(self.tmpdir, "no_table.json")
+
+        self.assertExportOk(self.export_flags(db, "dev", out), out, {})
+
+        self.assertEqual(self.read_table_names(db), ["notes"])
+
+    def test_env_without_rows_exports_empty_object(self):
+        # 库内只有其他环境的记录：导出 {}，不补默认值，不新增记录。
+        db = self.db_path("export_only_qa")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        out = os.path.join(self.tmpdir, "only_qa.json")
+
+        self.assertExportOk(self.export_flags(db, "dev", out), out, {})
+
+        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "true")])
+
+    def test_missing_parent_directory_reports_storage_error(self):
+        # 数据库父目录不存在：报 STORAGE_ERROR，不创建目录、数据库或
+        # 输出文件。
+        missing_dir = os.path.join(self.tmpdir, "export_missing_parent")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        out = os.path.join(self.tmpdir, "no_parent.json")
+        self.assertFalse(os.path.exists(missing_dir))
+
+        self.assertCommandError(self.export_flags(db, "dev", out), "STORAGE_ERROR")
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+        self.assertFalse(os.path.exists(out), "不得创建输出文件")
+
+    def test_plain_text_db_reports_storage_error(self):
+        # 目标是普通文本文件而非 SQLite 库：报 STORAGE_ERROR，文件逐字节
+        # 保持原样，不创建输出文件。
+        db = self.db_path("export_plain_text")
+        content = b"this is not a sqlite database\njust fictional config\n"
+        with open(db, "wb") as fh:
+            fh.write(content)
+        out = os.path.join(self.tmpdir, "plain_text.json")
+
+        self.assertCommandError(self.export_flags(db, "dev", out), "STORAGE_ERROR")
+
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), content)
+        self.assertFalse(os.path.exists(out), "不得创建输出文件")
+
+    def test_flags_table_without_value_column_reports_storage_error(self):
+        # flags 表缺少查询所需的 value 列：报 STORAGE_ERROR，表结构与
+        # 既有记录保持不变，不创建输出文件。
+        db = self.db_path("export_no_value_column")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.execute(
+                    "INSERT INTO flags (env, key) VALUES (?, ?)", ("qa", "new_ui")
+                )
+        finally:
+            conn.close()
+        out = os.path.join(self.tmpdir, "no_column.json")
+
+        self.assertCommandError(self.export_flags(db, "dev", out), "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_columns(db), ["env", "key"])
+        self.assertEqual(self.read_flags_env_key_rows(db), [("qa", "new_ui")])
+        self.assertFalse(os.path.exists(out), "不得创建输出文件")
+
+    def test_invalid_stored_value_in_target_env_reports_storage_error(self):
+        # 目标环境的已知键存有 true/false 之外的值：报 STORAGE_ERROR，
+        # 不创建输出文件，异常记录原样保留。
+        db = self.db_path("export_bad_value")
+        self.seed_flags_table(db, [("dev", "new_ui", "yes")])
+        out = os.path.join(self.tmpdir, "bad_value.json")
+
+        self.assertCommandError(self.export_flags(db, "dev", out), "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "yes")])
+        self.assertFalse(os.path.exists(out), "不得创建输出文件")
+
+    def test_unknown_keys_and_other_env_anomalies_do_not_affect_export(self):
+        # 未知键（含异常值）及其他环境的异常值不影响导出；导出后全部
+        # 原始记录逐行保持不变。
+        db = self.db_path("export_ignores_others")
+        self.seed_flags_table(
+            db,
+            [
+                ("dev", "new_ui", "false"),
+                ("dev", "other_key", "yes"),
+                ("qa", "new_ui", "yes"),
+            ],
+        )
+        before = self.read_flags_rows(db)
+        out = os.path.join(self.tmpdir, "ignores.json")
+
+        self.assertExportOk(self.export_flags(db, "dev", out), out, {"new_ui": False})
+
+        self.assertEqual(self.read_flags_rows(db), before)
+
+    def test_output_path_same_as_db_reports_export_write_error(self):
+        # 输出路径与数据库路径的规范化绝对路径相同（含 ./ 与冗余分隔符
+        # 等形式）：报 EXPORT_WRITE_ERROR，数据库文件逐字节保持原样。
+        db = self.db_path("export_same_path")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        with open(db, "rb") as fh:
+            before = fh.read()
+        same = os.path.join(self.tmpdir, ".", "export_same_path.sqlite")
+
+        self.assertCommandError(
+            self.export_flags(db, "dev", same), "EXPORT_WRITE_ERROR"
+        )
+
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_output_parent_missing_reports_export_write_error(self):
+        # 输出父目录缺失：报 EXPORT_WRITE_ERROR，不创建目录或文件，
+        # 源库记录保持原样。
+        db = self.db_path("export_out_no_parent")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        missing_dir = os.path.join(self.tmpdir, "export_out_dir")
+        out = os.path.join(missing_dir, "out.json")
+        self.assertFalse(os.path.exists(missing_dir))
+
+        self.assertCommandError(
+            self.export_flags(db, "dev", out), "EXPORT_WRITE_ERROR"
+        )
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的输出目录")
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "true")])
+
+    def test_export_does_not_modify_source_db(self):
+        # 成功导出全程只读源库：导出前后数据库文件逐字节一致。
+        db = self.db_path("export_readonly")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        with open(db, "rb") as fh:
+            before = fh.read()
+        out = os.path.join(self.tmpdir, "readonly.json")
+
+        self.assertExportOk(
+            self.export_flags(db, "dev", out), out, {"new_ui": False}
+        )
+
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), before)
 
 
 if __name__ == "__main__":
