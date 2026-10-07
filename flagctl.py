@@ -2,7 +2,7 @@
 """flagctl: 本地布尔功能开关命令行工具。
 
 用法:
-    python flagctl.py --db <数据库文件> set <环境名> <键名> <true|false>
+    python flagctl.py --db <数据库文件> set <环境名> <键名> <true|false> [--dry-run]
     python flagctl.py --db <数据库文件> get <环境名> <键名>
     python flagctl.py --db <数据库文件> unset <环境名> <键名>
     python flagctl.py --db <数据库文件> list <环境名>
@@ -144,7 +144,30 @@ def save_flags(db_path, env, items):
         conn.close()
 
 
-def cmd_set(db_path, env, key, value):
+def preview_set(db_path, env, key, value):
+    """只读预览单个键的直接设置将带来的变化。
+
+    返回 {键名: {"before": 原值或 None, "after": JSON 布尔值}}。存储
+    分类与值校验完全复用 cmd_list 唯一一份规则：库文件缺失但父目录
+    存在、有效库缺 flags 表或目标记录缺失时原值视为 None（null）；
+    父目录缺失、无效库、所需列缺失或目标记录值不是严格文本
+    true/false 时报 STORAGE_ERROR。其他环境及未知键记录不影响预览。
+    before 与 after 相同（含 false 等于已保存的 false）时输出 {}；
+    false 是有效设置，未设置不补默认值或继承值。纯只读，不创建目录、
+    库文件或表，不改动任何记录。
+    """
+    return preview_changes(db_path, env, {key: value == "true"})
+
+
+def cmd_set(db_path, env, key, value, dry_run=False):
+    """保存或覆盖一个直接设置，成功时回显所写入的布尔文本。
+
+    dry_run=True 时完全不写入，改为只读预览单键变化，输出只含该键
+    的 {"before": 原值或 None, "after": 目标值}；输入校验顺序、错误
+    码与存储分类与正式 set 一致，全程不创建或改动任何存储对象。
+    """
+    if dry_run:
+        return preview_set(db_path, env, key, value)
     save_flags(db_path, env, [(key, value)])
     return value
 
@@ -297,15 +320,17 @@ def load_import_file(file_path):
     return data
 
 
-def preview_import(db_path, env, data):
-    """只读预览非空导入将带来的变化，返回 {键名: {"before": .., "after": ..}}。
+def preview_changes(db_path, env, data):
+    """只读预览一批直接设置将带来的变化，返回
+    {键名: {"before": .., "after": ..}}。
 
-    只比较文件中出现的键与目标环境的直接设置，复用 cmd_list 唯一一份
-    存储分类与值校验：库文件缺失但父目录存在、有效库缺 flags 表或目标
+    import --dry-run 与 set --dry-run 共用这唯一一份预览规则。只比较
+    data 中出现的键与目标环境的直接设置，复用 cmd_list 唯一一份存储
+    分类与值校验：库文件缺失但父目录存在、有效库缺 flags 表或目标
     环境无设置时原值视为 None（null）；父目录缺失、无效库、所需列缺失
     或目标环境合法键的存储值不是严格文本 true/false 时报 STORAGE_ERROR。
     其他环境及未知键记录不影响结果。before 是原值（未设置为 None），
-    after 是文件中的导入布尔值；两者相同的键不输出。纯只读，不创建
+    after 是 data 中的目标布尔值；两者相同的键不输出。纯只读，不创建
     目录、库文件或表，不改动任何记录。
     """
     current = cmd_list(db_path, env)
@@ -338,7 +363,7 @@ def cmd_import(db_path, env, file_path, dry_run=False):
     if not data:
         return {}
     if dry_run:
-        return preview_import(db_path, env, data)
+        return preview_changes(db_path, env, data)
     save_flags(
         db_path,
         env,
@@ -440,6 +465,11 @@ def build_parser():
     p_set.add_argument("env")
     p_set.add_argument("key")
     p_set.add_argument("value")
+    p_set.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只预览该键将发生的变化，不写入数据库",
+    )
 
     p_get = sub.add_parser("get", help="读取开关值")
     p_get.add_argument("env")
@@ -502,7 +532,7 @@ def main(argv=None):
                 # 的单行 JSON 对象，--dry-run 输出仅含变化键的
                 # {"before": 原值或 null, "after": 导入值}，不写入存储。
                 if args.dry_run:
-                    # preview_import 已按键名排序，内层固定先 before 后
+                    # preview_changes 已按键名排序，内层固定先 before 后
                     # after；不用 sort_keys，以免调换两个字段的输出顺序。
                     # 紧凑分隔符，输出 {"key":{"before":..,"after":..}}。
                     result = json.dumps(
@@ -522,7 +552,17 @@ def main(argv=None):
                 validate_key(args.key)
                 if args.command == "set":
                     value = parse_bool(args.value)
-                    result = cmd_set(args.db, env, args.key, value)
+                    if args.dry_run:
+                        # set --dry-run 与 import --dry-run 共用同一份预览
+                        # 规则，内层固定先 before 后 after；不用 sort_keys，
+                        # 以免调换两个字段的顺序。紧凑分隔符，输出
+                        # {"key":{"before":..,"after":..}}。
+                        result = json.dumps(
+                            cmd_set(args.db, env, args.key, value, True),
+                            separators=(",", ":"),
+                        )
+                    else:
+                        result = cmd_set(args.db, env, args.key, value)
                 elif args.command == "unset":
                     result = cmd_unset(args.db, env, args.key)
                 else:

@@ -42,7 +42,7 @@ stderr 均为空。
 
 ## 命令一览
 
-    python flagctl.py --db <库> set <环境> <键> <true|false>
+    python flagctl.py --db <库> set <环境> <键> <true|false> [--dry-run]
     python flagctl.py --db <库> get <环境> <键>
     python flagctl.py --db <库> unset <环境> <键>
     python flagctl.py --db <库> list <环境>
@@ -52,7 +52,19 @@ stderr 均为空。
     python flagctl.py --db <库> export <环境> <JSON 文件>
 
 - **set**：保存或覆盖一个直接设置，成功时 stdout 回显所写入的
-  `true` / `false`。
+  `true` / `false`。附加 `--dry-run` 时完全不写入，无需 JSON 文件
+  即可只读预览这一个键将发生的变化：stdout 为单行 JSON 对象，形如
+  `{"new_ui":{"before":true,"after":false}}`，`before` 是目标记录的
+  原值（未设置用 `null`），`after` 是命令行给出的目标布尔值；原值与
+  目标值相同（含已保存的 `false` 再次设为 `false`）时输出 `{}`。
+  `false` 是有效设置，与未设置明确区分，预览不补默认值或继承值。
+  预览严格按环境名 → 键名 → 布尔文本的顺序校验，全部通过后才读取
+  存储（错误码与正式 set 一致）；库文件缺失但父目录存在、有效库缺
+  flags 表或目标记录缺失时原值视为 `null`，父目录缺失、无效库、查询
+  所需列缺失或目标记录值不是严格文本 `true`/`false` 时报
+  STORAGE_ERROR，不返回部分结果；其他环境和未知键记录不影响预览。
+  预览全程不创建目录、库文件或表，也不改动任何记录，重复调用得到
+  相同结果。
 - **get**：读取一个直接设置，stdout 为 `true` 或 `false`。
 - **unset**：删除该环境该键的直接设置（删除整行记录，而不是写入
   `false`）；成功时 stdout 为 `unset`。
@@ -126,13 +138,15 @@ stderr 均为空。
 - 同一 (env, key) 再次 set 会覆盖旧行（INSERT OR REPLACE）；
 - **set 首次写入时**（以及非空 import 首次导入时）会创建缺失的
   数据库文件并用 `CREATE TABLE IF NOT EXISTS` 建表；
-- **get、unset、list、diff、envs 不补建任何文件或表**：库文件不存在
-  或缺 flags 表时按下文的错误/空结果规则处理。
+- **get、unset、list、diff、envs 以及 set/import 的 --dry-run 预览不
+  补建任何文件或表**：库文件不存在或缺 flags 表时按各自的错误/空结果
+  规则处理。
 
 ## 输出协议
 
 - **成功**：退出码 0；stderr 为空；stdout 为单行结果加换行。
-  set/get 输出布尔文本，unset 输出 `unset`，list/diff 输出一行
+  set/get 输出布尔文本（set 附加 `--dry-run` 时为例外，输出紧凑的
+  单行 JSON 变化对象），unset 输出 `unset`，list/diff 输出一行
   JSON 对象，envs 输出一行 JSON 数组。
 - **失败**：退出码 2；stdout 为空；stderr 仅为错误码加换行，
   例如 `VALUE_NOT_SET`，不附带其他文本。
@@ -155,9 +169,10 @@ stderr 均为空。
   记录。父目录存在但数据库文件缺失、或文件是有效 SQLite 库但缺少
   flags 表时，也按此处理——查询不会顺手补建文件或表。
 - **STORAGE_ERROR**：父目录不存在；目标文件不是有效的 SQLite 数据库；
-  操作所需的表列缺失；以及 get、list、diff、envs、export 在目标范围内
-  读到已知键保存了 `true` / `false` 之外的非法值（数据损坏）。envs 的
-  目标范围是全库：库中任一合法键的值非法都报此错，不输出部分名单。
+  操作所需的表列缺失；以及 get、list、diff、envs、export 和
+  set --dry-run 在目标范围内读到已知键保存了 `true` / `false` 之外的
+  非法值（数据损坏）。envs 的目标范围是全库：库中任一合法键的值非法
+  都报此错，不输出部分名单。
 - **EXPORT_EXISTS**：export 的输出文件已存在；原内容保留，不被覆盖。
 - **EXPORT_WRITE_ERROR**：export 的输出路径与数据库路径相同、输出
   父目录不存在、无法写入或写入失败。不创建目录，失败不遗留新增的
@@ -166,7 +181,9 @@ stderr 均为空。
 校验顺序与副作用：
 
 - set 严格按 **环境名 → 键名 → 布尔文本** 的顺序校验，任一失败都在
-  访问存储之前拒绝，因此输入校验失败不会创建数据库文件或表。
+  访问存储之前拒绝，因此输入校验失败不会创建数据库文件或表；附加
+  `--dry-run` 时校验顺序与错误码不变，只是在全部校验通过后只读查询
+  原值并输出变化，绝不写入。
 - import 严格按 **环境名 → 读文件 → JSON 解析 → 全部键名 → 全部
   布尔值** 的顺序校验，全部通过后才访问数据库；校验失败不会创建
   数据库或表，也不会改动任何记录。非空导入在一个事务中写入，遇到
