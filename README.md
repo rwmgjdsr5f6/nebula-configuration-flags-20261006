@@ -46,7 +46,7 @@ stderr 均为空。
     python flagctl.py --db <库> get <环境> <键>
     python flagctl.py --db <库> unset <环境> <键> [--dry-run]
     python flagctl.py --db <库> list <环境>
-    python flagctl.py --db <库> diff <环境左> <环境右>
+    python flagctl.py --db <库> diff <环境左> <环境右> [--exit-code]
     python flagctl.py --db <库> envs
     python flagctl.py --db <库> import <环境> <JSON 文件>
     python flagctl.py --db <库> export <环境> <JSON 文件>
@@ -85,7 +85,9 @@ stderr 均为空。
 - **diff**：按参数顺序比较两个环境的直接设置，只输出两侧不同的键，
   例如 `{"new_ui": {"left": false, "right": null}}`；一侧未设置用
   JSON `null` 表示。两侧都没有任何设置（或所有已知键两侧相同）时
-  输出 `{}`。
+  输出 `{}`。附加 `--exit-code` 时 stdout/stderr 协议不变，但退出码
+  额外表达比较结果：差异对象为空退出 0、非空退出 1；不加该参数时
+  无论有无差异都退出 0。两种情况下比较失败仍退出 2（见“输出协议”）。
 - **envs**：输出库中“已有直接设置的环境”组成的 JSON 数组，例如
   `["dev", "qa"]`。环境含有至少一个合法键（`new_ui`）的直接设置时
   才出现，直接设置为 `false` 也算已设置；只有未知键记录的环境不
@@ -160,9 +162,12 @@ stderr 均为空。
   set/get 输出布尔文本（set 附加 `--dry-run` 时为例外，输出紧凑的
   单行 JSON 变化对象），unset 输出 `unset`（附加 `--dry-run` 时同为
   例外，输出紧凑的单行 JSON 变化对象），list/diff 输出一行
-  JSON 对象，envs 输出一行 JSON 数组。
+  JSON 对象，envs 输出一行 JSON 数组。唯一的例外是 diff 附加
+  `--exit-code`：stdout/stderr 仍是同一份单行 JSON 与空 stderr，但
+  完整比较发现差异（差异对象非空）时退出 1，差异对象为空时仍退出 0。
 - **失败**：退出码 2；stdout 为空；stderr 仅为错误码加换行，
-  例如 `VALUE_NOT_SET`，不附带其他文本。
+  例如 `VALUE_NOT_SET`，不附带其他文本。diff `--exit-code` 的退出码
+  1 只表示“完整比较发现差异”，不表示失败；任一比较失败仍退出 2。
 
 ## 错误码
 

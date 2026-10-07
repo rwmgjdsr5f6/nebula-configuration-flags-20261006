@@ -6,7 +6,7 @@
     python flagctl.py --db <数据库文件> get <环境名> <键名>
     python flagctl.py --db <数据库文件> unset <环境名> <键名> [--dry-run]
     python flagctl.py --db <数据库文件> list <环境名>
-    python flagctl.py --db <数据库文件> diff <环境名左> <环境名右>
+    python flagctl.py --db <数据库文件> diff <环境名左> <环境名右> [--exit-code]
     python flagctl.py --db <数据库文件> envs
     python flagctl.py --db <数据库文件> import <环境名> <JSON 文件> [--dry-run]
     python flagctl.py --db <数据库文件> export <环境名> <JSON 文件>
@@ -24,6 +24,7 @@ import sys
 KNOWN_KEYS = frozenset({"new_ui"})
 
 EXIT_OK = 0
+EXIT_DIFF = 1
 EXIT_ERROR = 2
 
 SCHEMA = """
@@ -521,6 +522,11 @@ def build_parser():
     p_diff = sub.add_parser("diff", help="只读比较两个环境的直接设置")
     p_diff.add_argument("env_left")
     p_diff.add_argument("env_right")
+    p_diff.add_argument(
+        "--exit-code",
+        action="store_true",
+        help="比较发现差异时以退出码 1 结束（无差异仍为 0，失败为 2）",
+    )
 
     sub.add_parser("envs", help="列出库中已有直接设置的环境名")
 
@@ -542,6 +548,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    exit_code = EXIT_OK
     try:
         if args.command == "envs":
             # envs 不接收环境名或键名：只读输出环境名组成的单行 JSON 数组。
@@ -553,7 +560,14 @@ def main(argv=None):
             right = normalize_env(args.env_right)
             validate_env(left)
             validate_env(right)
-            result = json.dumps(cmd_diff(args.db, left, right), sort_keys=True)
+            diff_result = cmd_diff(args.db, left, right)
+            result = json.dumps(diff_result, sort_keys=True)
+            # 仅在显式要求 --exit-code 时用退出码表达比较结果：完整比较
+            # 发现差异（差异对象非空）退出 1；不加该参数时即使有差异也
+            # 仍退出 0。两种成功情形的 stdout/stderr 协议完全相同；任何
+            # 失败仍走下方 FlagError 分支退出 2，不输出部分差异。
+            if args.exit_code and diff_result:
+                exit_code = EXIT_DIFF
         else:
             env = normalize_env(args.env)
             # 输入错误按环境名、键名、布尔值的顺序判断，
@@ -617,7 +631,7 @@ def main(argv=None):
         sys.stderr.write(exc.code + "\n")
         return EXIT_ERROR
     sys.stdout.write(result + "\n")
-    return EXIT_OK
+    return exit_code
 
 
 if __name__ == "__main__":

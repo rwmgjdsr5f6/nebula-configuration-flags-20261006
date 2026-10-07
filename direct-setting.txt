@@ -64,6 +64,11 @@ PRIMARY KEY (env, key))。
     JSON 空格不影响含义，紧凑写法 {"new_ui":{"left":false,"right":null}}
     与它表达同一结果，按 JSON 解析后应相等。
 
+  可选的 --exit-code 只改变退出码、不改变 stdout/stderr：同一比较附加
+  --exit-code 时仍输出上面这一行 JSON、stderr 为空，但因差异对象非空
+  而退出 1；差异对象为空（如 2.3 中两侧都未设置）时退出 0；比较失败
+  仍退出 2。不加该参数时维持原行为，存在差异也退出 0。
+
 2.2 撤销 dev 的直接设置
 
     输入：
