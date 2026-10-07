@@ -52,6 +52,15 @@
   目标为普通文本文件两种异常存储路径下依旧退出 0、stdout 严格为
   {} 且不创建目录或改动文件字节，同一库路径上的非空导入对照报
   STORAGE_ERROR 且现场保持不变。
+* import 非空导入在事务内写入失败时的回滚与恢复重试：固定样例
+  demo.sqlite（标准 flags 表，仅 dev/new_ui=true 与 qa/new_ui=true）
+  导入 {"new_ui": false}，目标行已在事务内写成 false 而尚未提交时
+  发生 SQLite 写入错误（注入点自证该时序并留下可核对证据），退出 2、
+  stdout 为空、stderr 仅为 STORAGE_ERROR 加换行；重新打开数据库后
+  dev 与 qa 均仍为 true，完整记录与表结构不变，导入文件内容不变；
+  解除失败条件后以同一环境同一文件立即重试，退出 0、stderr 为空、
+  stdout 为单行 {"new_ui": false} 加换行，dev 变为 false、qa 仍为
+  true，完整记录仅这两条。
 * export 把单环境已保存的直接设置导出为 JSON 文件：固定样例
   dev/new_ui=false、qa/new_ui=true 导出 dev 得到 {"new_ui": false}，
   stdout 与文件同为单行 JSON 加换行（无 BOM），再导入另一库的
@@ -2280,6 +2289,183 @@ class TestImportEmptyObjectAbnormalStorage(FlagctlCliTestCase):
             "broken: 非空导入失败后文件字节必须保持不变，实际: %r"
             % after_nonempty,
         )
+
+
+class TestImportWriteFailureRollback(FlagctlCliTestCase):
+    """非空 import 在事务内写入失败时的回滚与恢复重试回归。
+
+    固定样例：demo.sqlite 已有标准 flags 表，完整记录仅为
+    dev/new_ui=true 与 qa/new_ui=true；settings.json 是 UTF-8 文件，
+    内容为 {"new_ui": false}。通过包装进程以与既有入口等价的方式
+    （同样的 --db ... import dev settings.json 参数交给
+    flagctl.main()）发起导入，仅把 flagctl.connect 换成注入失败的
+    版本：代理连接在 executemany 实际落库之后、事务提交之前核对
+    dev 行当前值确为 false 且事务仍在进行，把该时序证据写入证据
+    文件（不满足时以退出码 99/98 让用例明确失败，不允许用写入之前
+    的失败代替），然后抛出 sqlite3.OperationalError 模拟写入错误。
+
+    失败调用退出 2、stdout 为空、stderr 仅为 STORAGE_ERROR 加换行；
+    重新打开数据库后 dev 与 qa 均仍为 true，完整 flags 记录与表结构
+    与调用前一致，导入文件内容保持原样。随后解除失败条件，用既有
+    入口以同一环境同一文件立即重试：退出 0、stderr 为空、stdout 为
+    单行 {"new_ui": false} 加换行，dev 的直接设置为 false、qa 仍为
+    true，完整记录仅这两条。失败注入只发生在包装进程内，样例准备与
+    正常重试按既有行为执行。
+    """
+
+    # 包装脚本：以与 ``python flagctl.py --db ... import dev ...`` 等价
+    # 的方式调用 flagctl.main()，仅把 flagctl.connect 换成注入失败的
+    # 版本。失败注入发生在 executemany 落库之后、提交之前；脚本内对此
+    # 自查并留下证据文件，不满足时以 99/98 退出让用例失败。
+    WRAPPER_TEMPLATE = '''import os
+import sqlite3
+import sys
+
+sys.path.insert(0, {here!r})
+import flagctl
+
+EVIDENCE = os.environ["FLAGCTL_TEST_EVIDENCE"]
+
+real_connect = flagctl.connect
+
+
+class WriteFailConnection(object):
+    """代理连接：executemany 落库后、事务提交前注入 SQLite 写入错误。"""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+    def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+
+    def executemany(self, sql, params):
+        cursor = self._conn.executemany(sql, params)
+        # 时序自查：目标行已在事务内写成 false 且尚未提交；证据写入
+        # 证据文件供用例核对，不满足时以 99/98 退出让用例明确失败。
+        row = self._conn.execute(
+            "SELECT value FROM flags WHERE env = ? AND key = ?",
+            ("dev", "new_ui"),
+        ).fetchone()
+        in_transaction = self._conn.in_transaction
+        with open(EVIDENCE, "w", encoding="utf-8") as fh:
+            fh.write(
+                "value=%r in_transaction=%r\\n"
+                % (row[0] if row else None, in_transaction)
+            )
+        if row is None or row[0] != "false":
+            sys.exit(99)
+        if not in_transaction:
+            sys.exit(98)
+        raise sqlite3.OperationalError("simulated import write failure")
+
+    def close(self):
+        self._conn.close()
+
+
+def failing_connect(db_path):
+    return WriteFailConnection(real_connect(db_path))
+
+
+flagctl.connect = failing_connect
+
+sys.exit(flagctl.main())
+'''
+
+    def make_demo_db(self):
+        """固定样例库 demo.sqlite：标准 flags 表，仅 dev/qa 的 new_ui=true。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    [("dev", "new_ui", "true"), ("qa", "new_ui", "true")],
+                )
+        finally:
+            conn.close()
+        return db
+
+    def write_wrapper(self):
+        """在临时目录写入失败注入包装脚本并返回路径。"""
+        wrapper = os.path.join(self.tmpdir, "failing_import.py")
+        with open(wrapper, "w", encoding="utf-8") as fh:
+            fh.write(self.WRAPPER_TEMPLATE.format(here=HERE))
+        return wrapper
+
+    def run_failing_import(self, wrapper, db, settings, evidence):
+        """在包装进程中执行 import dev settings.json，注入事务内写入失败。"""
+        env = dict(os.environ)
+        env["FLAGCTL_TEST_EVIDENCE"] = evidence
+        return subprocess.run(
+            [sys.executable, wrapper, "--db", db, "import", "dev", settings],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+    def test_write_failure_rolls_back_then_retry_succeeds(self):
+        db = self.make_demo_db()
+        settings = self.write_import_file('{"new_ui": false}')
+        wrapper = self.write_wrapper()
+        evidence = os.path.join(self.tmpdir, "evidence.txt")
+
+        rows_before = self.read_flags_rows(db)
+        cols_before = self.read_flags_columns(db)
+        self.assertEqual(
+            rows_before, [("dev", "new_ui", "true"), ("qa", "new_ui", "true")]
+        )
+        self.assertEqual(cols_before, ["env", "key", "value"])
+        with open(settings, "rb") as fh:
+            settings_bytes = fh.read()
+        self.assertEqual(settings_bytes, b'{"new_ui": false}')
+
+        proc = self.run_failing_import(wrapper, db, settings, evidence)
+
+        # 退出 2、stdout 为空、stderr 仅为 STORAGE_ERROR 加换行；若注入
+        # 发生在写入之前或事务已提交，包装进程会以 99/98 退出，下面的
+        # 断言随之失败。
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        # 可核对的时序证据：失败发生时目标行已在事务内写成 false 且
+        # 尚未提交，回滚验证确实涉及已发生的修改。
+        self.assertTrue(os.path.isfile(evidence), "注入点必须留下时序证据文件")
+        with open(evidence, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "value='false' in_transaction=True\n")
+
+        # 回滚后重新打开数据库：dev 与 qa 均仍为 true，完整记录与表结构
+        # 与调用前一致，导入文件内容保持原样。
+        self.assertEqual(self.read_table_names(db), ["flags"])
+        self.assertEqual(self.read_flags_columns(db), cols_before)
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+        with open(settings, "rb") as fh:
+            self.assertEqual(fh.read(), settings_bytes, "导入文件内容必须保持原样")
+
+        # 解除失败条件，用既有入口以同一环境同一文件立即重试。
+        retry = self.import_flags(db, "dev", settings)
+        self.assertCommandOk(retry, '{"new_ui": false}')
+
+        # 重试后 dev 的直接设置为 false、qa 仍为 true，完整记录仅这两条，
+        # 证明失败没有留下妨碍后续导入的状态。
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+        self.assertEqual(self.read_flags_columns(db), cols_before)
+        with open(settings, "rb") as fh:
+            self.assertEqual(fh.read(), settings_bytes, "重试后导入文件内容必须保持原样")
 
 
 class TestExport(FlagctlCliTestCase):
