@@ -48,7 +48,10 @@
   解析 -> 键名 -> 布尔值的校验顺序（EMPTY_ENV / IMPORT_READ_ERROR
   / INVALID_JSON / UNKNOWN_KEY / INVALID_BOOL），校验失败不创建
   库或表、不改动记录；父目录不存在、普通文本文件、flags 表缺列
-  报 STORAGE_ERROR 且既有记录保持原样。
+  报 STORAGE_ERROR 且既有记录保持原样；空对象 {} 在父目录缺失与
+  目标为普通文本文件两种异常存储路径下依旧退出 0、stdout 严格为
+  {} 且不创建目录或改动文件字节，同一库路径上的非空导入对照报
+  STORAGE_ERROR 且现场保持不变。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
 每个用例使用独立的临时目录，结束后自动清理，只依赖 Python 3 标准库。
@@ -2120,6 +2123,137 @@ class TestImport(FlagctlCliTestCase):
                 ("dev", "other_key", "true"),
                 ("qa", "new_ui", "false"),
             ],
+        )
+
+
+class TestImportEmptyObjectAbnormalStorage(FlagctlCliTestCase):
+    """空对象 {} 导入在异常存储路径下的成功/失败对照回归。
+
+    空对象成功的前提只是环境名与输入文件通过既有校验，之后直接
+    返回 {}，全程不访问数据库：因此无论存储路径处于什么异常状态
+    都必须退出 0、stdout 严格为 ``{}\\n``、stderr 为空，且不创建
+    任何目录或文件、不改动已有文件字节。同一路径上的非空导入
+    （{"new_ui": false}）必须真正访问存储并报 STORAGE_ERROR，
+    退出 2、stdout 为空、stderr 严格为 ``STORAGE_ERROR\\n``，
+    现场与调用前一致。两组固定样例：
+
+    * missing：目录 missing 及其中的 flags.sqlite 均不存在；
+    * broken：broken.sqlite 已存在但内容是固定文本 local demo
+      （10 字节，不是 SQLite 数据库）。
+    """
+
+    EMPTY_JSON = b"{}"
+    NONEMPTY_JSON = b'{"new_ui":false}'
+    BROKEN_TEXT = b"local demo"
+
+    def write_named_file(self, name, content):
+        """在临时目录按固定文件名写入 UTF-8 字节，返回完整路径。"""
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(content)
+        return path
+
+    def assert_import_empty_ok_and_untouched(self, db, state, empty_path):
+        """import dev empty.json 成功输出 {}，且存储现场保持不变。"""
+        proc = self.import_flags(db, "dev", empty_path)
+        self.assertEqual(
+            proc.returncode, 0,
+            "%s: 空对象导入应退出 0，实际 stderr: %r" % (state, proc.stderr),
+        )
+        self.assertEqual(
+            proc.stdout, "{}\n",
+            "%s: 空对象导入 stdout 应为 {}\\n，实际: %r" % (state, proc.stdout),
+        )
+        self.assertEqual(
+            proc.stderr, "",
+            "%s: 空对象导入 stderr 应为空，实际: %r" % (state, proc.stderr),
+        )
+
+    def assert_import_nonempty_error_and_untouched(self, db, state, nonempty_path):
+        """import dev nonempty.json 报 STORAGE_ERROR，stdout 为空，现场不变。"""
+        proc = self.import_flags(db, "dev", nonempty_path)
+        self.assertEqual(
+            proc.returncode, 2,
+            "%s: 非空导入应退出 2，实际 stdout: %r stderr: %r"
+            % (state, proc.stdout, proc.stderr),
+        )
+        self.assertEqual(
+            proc.stdout, "",
+            "%s: 非空导入 stdout 应为空，实际: %r" % (state, proc.stdout),
+        )
+        self.assertEqual(
+            proc.stderr, "STORAGE_ERROR\n",
+            "%s: 非空导入 stderr 应为 STORAGE_ERROR\\n，实际: %r"
+            % (state, proc.stderr),
+        )
+
+    def test_missing_directory_empty_succeeds_nonempty_errors(self):
+        # 第一组：missing 目录及 flags.sqlite 均不存在。
+        # 空对象导入退出 0、输出 {}\n、stderr 为空，目录与数据库
+        # 仍不存在；随后非空导入报 STORAGE_ERROR，目录与数据库
+        # 仍不存在（空对象的成功不代表非空导入也可写）。
+        empty_path = self.write_named_file("empty.json", self.EMPTY_JSON)
+        nonempty_path = self.write_named_file("nonempty.json", self.NONEMPTY_JSON)
+
+        missing_dir = os.path.join(self.tmpdir, "missing")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+        self.assertFalse(os.path.exists(db))
+
+        self.assert_import_empty_ok_and_untouched(
+            db, "missing 目录缺失", empty_path
+        )
+        self.assertFalse(
+            os.path.exists(missing_dir),
+            "missing: 空对象导入不得创建缺失的父目录",
+        )
+        self.assertFalse(
+            os.path.exists(db), "missing: 空对象导入不得创建数据库文件"
+        )
+
+        self.assert_import_nonempty_error_and_untouched(
+            db, "missing 目录缺失", nonempty_path
+        )
+        self.assertFalse(
+            os.path.exists(missing_dir),
+            "missing: 非空导入失败不得创建缺失的父目录",
+        )
+        self.assertFalse(
+            os.path.exists(db), "missing: 非空导入失败不得创建数据库文件"
+        )
+
+    def test_plain_text_db_empty_succeeds_nonempty_errors(self):
+        # 第二组：broken.sqlite 已存在，内容为固定文本 local demo，
+        # 不是 SQLite 数据库。空对象导入退出 0、输出 {}\n、stderr
+        # 为空，文件字节完全不变；随后非空导入报 STORAGE_ERROR，
+        # 文件字节依旧完全不变。
+        empty_path = self.write_named_file("empty.json", self.EMPTY_JSON)
+        nonempty_path = self.write_named_file("nonempty.json", self.NONEMPTY_JSON)
+
+        db = os.path.join(self.tmpdir, "broken.sqlite")
+        with open(db, "wb") as fh:
+            fh.write(self.BROKEN_TEXT)
+        self.assertTrue(os.path.isfile(db))
+
+        self.assert_import_empty_ok_and_untouched(
+            db, "broken.sqlite 为普通文本", empty_path
+        )
+        with open(db, "rb") as fh:
+            after_empty = fh.read()
+        self.assertEqual(
+            after_empty, self.BROKEN_TEXT,
+            "broken: 空对象导入后文件字节必须保持不变，实际: %r" % after_empty,
+        )
+
+        self.assert_import_nonempty_error_and_untouched(
+            db, "broken.sqlite 为普通文本", nonempty_path
+        )
+        with open(db, "rb") as fh:
+            after_nonempty = fh.read()
+        self.assertEqual(
+            after_nonempty, self.BROKEN_TEXT,
+            "broken: 非空导入失败后文件字节必须保持不变，实际: %r"
+            % after_nonempty,
         )
 
 
