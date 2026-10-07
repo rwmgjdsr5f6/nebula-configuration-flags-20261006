@@ -41,6 +41,12 @@
   返回 {} 且不创建文件或表；父目录不存在、目标为普通文本文件、
   flags 表缺 value 列或任一目标环境存有非法值时报 STORAGE_ERROR，
   不输出部分差异，且调用前后目录、文件字节、表结构与记录保持不变。
+* import 从 JSON 文件导入一个环境的直接设置：覆盖目标环境同名键、
+  保留其他环境记录，false 是实际设置；空对象 {} 成功且不访问
+  数据库；非空导入创建缺失的库文件与 flags 表但不创建父目录；
+  EMPTY_ENV 先于文件读取，IMPORT_READ_ERROR / INVALID_JSON /
+  UNKNOWN_KEY / INVALID_BOOL 按序校验且全部先于存储访问；父目录
+  不存在、无效数据库、flags 缺列报 STORAGE_ERROR 且既有记录不变。
 
 所有业务调用均以子进程执行 ``python flagctl.py --db <临时数据库>``，
 每个用例使用独立的临时目录，结束后自动清理，只依赖 Python 3 标准库。
@@ -100,6 +106,17 @@ class FlagctlCliTestCase(unittest.TestCase):
 
     def envs_flags(self, db):
         return self.run_flagctl(db, "envs")
+
+    def import_flags(self, db, env, file_path):
+        return self.run_flagctl(db, "import", env, file_path)
+
+    def write_import_file(self, content, label="settings", binary=False):
+        """在临时目录写入一个导入文件，返回其路径。"""
+        path = os.path.join(self.tmpdir, label + ".json")
+        mode = "wb" if binary else "w"
+        with open(path, mode) as fh:
+            fh.write(content)
+        return path
 
     def read_table_names(self, db):
         """返回数据库中全部用户表名（升序）。"""
@@ -1654,6 +1671,228 @@ class TestEnvs(FlagctlCliTestCase):
         proc = self.run_flagctl(db, "envs", "dev")
         self.assertNotEqual(proc.returncode, 0)
         self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
+
+
+class TestImport(FlagctlCliTestCase):
+    """import 从 JSON 文件导入一个环境的直接设置。
+
+    输出协议：成功退出 0、stderr 为空、stdout 为仅含本次导入项的单行
+    JSON 对象加换行；失败退出 2、stdout 为空、stderr 仅为错误码加换行。
+    导入覆盖目标环境中出现的同名键，保留其他环境和未出现的记录；
+    false 是实际设置而非删除。输入校验（环境名 → 文件读取 → JSON 解析
+    → 键名 → 布尔值）全部通过后才访问数据库。
+    """
+
+    def assertImportOk(self, proc, expected):
+        """退出 0、stderr 为空、stdout 为单行 JSON 且解析结果等于 expected。"""
+        self.assertEqual(
+            proc.returncode, 0, "期望退出码 0，实际 stderr: %r" % proc.stderr
+        )
+        self.assertEqual(proc.stderr, "")
+        self.assertTrue(proc.stdout.endswith("\n"), "输出必须以换行结束")
+        body = proc.stdout[:-1]
+        self.assertNotIn("\n", body, "JSON 输出必须只有一行")
+        self.assertEqual(json.loads(body), expected)
+
+    def test_import_overwrites_target_env_and_keeps_others(self):
+        # 验收样例：库内已有 dev/new_ui=true 与 qa/new_ui=true，
+        # 导入 {"new_ui": false} 后 dev 变为 false，qa 保持 true。
+        db = self.db_path("import_sample")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        settings = self.write_import_file('{"new_ui":false}')
+
+        self.assertImportOk(self.import_flags(db, "dev", settings), {"new_ui": False})
+
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+
+    def test_import_creates_missing_db_and_table(self):
+        # 非空导入沿用 set 的行为：创建缺失的数据库文件与 flags 表。
+        db = self.db_path("import_fresh")
+        self.assertFalse(os.path.exists(db))
+        settings = self.write_import_file('{"new_ui": true}')
+
+        self.assertImportOk(self.import_flags(db, "dev", settings), {"new_ui": True})
+
+        self.assertTrue(os.path.isfile(db))
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "true")])
+
+    def test_import_env_surrounding_whitespace_stripped(self):
+        # 环境名去除两端空白后落库，与 set 的 normalize_env 行为一致。
+        db = self.db_path("import_whitespace")
+        settings = self.write_import_file('{"new_ui": true}')
+
+        self.assertImportOk(self.import_flags(db, "  dev  ", settings), {"new_ui": True})
+
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "true")])
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
+
+    def test_empty_object_succeeds_without_touching_storage(self):
+        # 空对象 {} 成功返回 {}，不访问数据库：父目录不存在也不报错，
+        # 不创建目录或文件。
+        missing_dir = os.path.join(self.tmpdir, "import_empty_no_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        settings = self.write_import_file("{}")
+
+        self.assertImportOk(self.import_flags(db, "dev", settings), {})
+
+        self.assertFalse(os.path.exists(missing_dir), "空导入不得创建父目录")
+        self.assertFalse(os.path.exists(db), "空导入不得创建数据库文件")
+
+    def test_empty_object_leaves_existing_rows_untouched(self):
+        # 空对象导入到已有记录的库：成功且所有记录保持原样。
+        db = self.db_path("import_empty_kept")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        settings = self.write_import_file("{}")
+
+        self.assertImportOk(self.import_flags(db, "dev", settings), {})
+
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "false")])
+
+    def test_empty_env_rejected_before_reading_file(self):
+        # 空或全空白环境名先报 EMPTY_ENV：即使导入文件不存在也不报
+        # IMPORT_READ_ERROR，且不创建数据库文件。
+        db = self.db_path("import_empty_env")
+        missing_file = os.path.join(self.tmpdir, "no_such_file.json")
+        for env in ["", "   "]:
+            with self.subTest(env=env):
+                proc = self.import_flags(db, env, missing_file)
+                self.assertCommandError(proc, "EMPTY_ENV")
+        self.assertFalse(os.path.exists(db), "校验失败不得创建数据库文件")
+
+    def test_missing_file_reports_import_read_error(self):
+        # 文件不存在：报 IMPORT_READ_ERROR，不创建数据库文件。
+        db = self.db_path("import_missing_file")
+        missing_file = os.path.join(self.tmpdir, "no_such_file.json")
+
+        self.assertCommandError(
+            self.import_flags(db, "dev", missing_file), "IMPORT_READ_ERROR"
+        )
+        self.assertFalse(os.path.exists(db), "读取失败不得创建数据库文件")
+
+    def test_unreadable_file_reports_import_read_error_and_keeps_rows(self):
+        # 文件无法读取（目标是目录）：报 IMPORT_READ_ERROR，既有记录不变。
+        db = self.db_path("import_unreadable")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+
+        self.assertCommandError(
+            self.import_flags(db, "dev", self.tmpdir), "IMPORT_READ_ERROR"
+        )
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "true")])
+
+    def test_invalid_json_inputs_report_invalid_json(self):
+        # 非法 UTF-8、JSON 语法错误、顶层不是对象、重复键均报
+        # INVALID_JSON，且不创建数据库文件。
+        cases = [
+            ("bad_utf8", b'{"new_ui": "\xff"}', True),
+            ("syntax", b'{"new_ui": }', True),
+            ("top_array", b"[true]", True),
+            ("top_bool", b"true", True),
+            ("dup_keys", b'{"new_ui": true, "new_ui": false}', True),
+        ]
+        for index, (label, content, _) in enumerate(cases):
+            with self.subTest(label=label):
+                db = self.db_path("import_badjson_" + label)
+                settings = self.write_import_file(content, label, binary=True)
+                self.assertCommandError(
+                    self.import_flags(db, "dev", settings), "INVALID_JSON"
+                )
+                self.assertFalse(
+                    os.path.exists(db), "校验失败不得创建数据库文件: %s" % db
+                )
+
+    def test_unknown_key_rejected_before_value_check_and_storage(self):
+        # 未知键报 UNKNOWN_KEY（即使值也非法），不创建数据库文件。
+        db = self.db_path("import_unknown_key")
+        settings = self.write_import_file('{"other_key": "not-a-bool"}')
+
+        self.assertCommandError(self.import_flags(db, "dev", settings), "UNKNOWN_KEY")
+        self.assertFalse(os.path.exists(db), "校验失败不得创建数据库文件")
+
+    def test_non_boolean_value_reports_invalid_bool_and_keeps_rows(self):
+        # 值不是 JSON 布尔值（字符串、数字、null）：报 INVALID_BOOL，
+        # 既有记录保持原样。
+        invalid = ['"false"', "1", "0", "null", '"true"', "[true]", '{"x": true}']
+        for index, literal in enumerate(invalid):
+            with self.subTest(literal=literal):
+                db = self.db_path("import_bad_bool_%d" % index)
+                self.assertCommandOk(
+                    self.set_flag(db, "dev", "new_ui", "true"), "true"
+                )
+                settings = self.write_import_file(
+                    '{"new_ui": %s}' % literal, "bad_bool_%d" % index
+                )
+
+                self.assertCommandError(
+                    self.import_flags(db, "dev", settings), "INVALID_BOOL"
+                )
+                self.assertEqual(
+                    self.read_flags_rows(db), [("dev", "new_ui", "true")]
+                )
+
+    def test_validation_failure_does_not_create_db_or_table(self):
+        # 校验失败（INVALID_BOOL）在父目录不存在时不降级为 STORAGE_ERROR，
+        # 也不创建目录或文件。
+        missing_dir = os.path.join(self.tmpdir, "import_no_parent_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        settings = self.write_import_file('{"new_ui": "false"}')
+
+        self.assertCommandError(self.import_flags(db, "dev", settings), "INVALID_BOOL")
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_missing_parent_directory_reports_storage_error(self):
+        # 非空导入遇到父目录不存在：报 STORAGE_ERROR，不创建目录或文件。
+        missing_dir = os.path.join(self.tmpdir, "import_no_such_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        settings = self.write_import_file('{"new_ui": true}')
+
+        self.assertCommandError(self.import_flags(db, "dev", settings), "STORAGE_ERROR")
+
+        self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+        self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_plain_text_db_reports_storage_error_and_file_unchanged(self):
+        # 目标是普通文本文件：报 STORAGE_ERROR，文件逐字节保持原样。
+        db = self.db_path("import_plain_text")
+        content = b"this is not a sqlite database\njust fictional config\n"
+        with open(db, "wb") as fh:
+            fh.write(content)
+        settings = self.write_import_file('{"new_ui": true}')
+
+        self.assertCommandError(self.import_flags(db, "dev", settings), "STORAGE_ERROR")
+
+        with open(db, "rb") as fh:
+            self.assertEqual(fh.read(), content)
+
+    def test_flags_table_without_value_column_reports_storage_error(self):
+        # flags 表缺少所需列：报 STORAGE_ERROR，表结构与既有记录不变。
+        db = self.db_path("import_no_value_column")
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.execute(
+                    "INSERT INTO flags (env, key) VALUES (?, ?)", ("qa", "new_ui")
+                )
+        finally:
+            conn.close()
+        settings = self.write_import_file('{"new_ui": true}')
+
+        self.assertCommandError(self.import_flags(db, "dev", settings), "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_columns(db), ["env", "key"])
+        self.assertEqual(self.read_flags_env_key_rows(db), [("qa", "new_ui")])
 
 
 if __name__ == "__main__":
