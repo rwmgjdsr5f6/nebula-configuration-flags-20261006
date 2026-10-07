@@ -6,7 +6,7 @@
     python flagctl.py --db <数据库文件> get <环境名> <键名>
     python flagctl.py --db <数据库文件> unset <环境名> <键名> [--dry-run]
     python flagctl.py --db <数据库文件> list <环境名>
-    python flagctl.py --db <数据库文件> diff <环境名左> <环境名右>
+    python flagctl.py --db <数据库文件> diff <环境名左> <环境名右> [--exit-code]
     python flagctl.py --db <数据库文件> envs
     python flagctl.py --db <数据库文件> import <环境名> <JSON 文件> [--dry-run]
     python flagctl.py --db <数据库文件> export <环境名> <JSON 文件>
@@ -521,6 +521,11 @@ def build_parser():
     p_diff = sub.add_parser("diff", help="只读比较两个环境的直接设置")
     p_diff.add_argument("env_left")
     p_diff.add_argument("env_right")
+    p_diff.add_argument(
+        "--exit-code",
+        action="store_true",
+        help="比较成功时用退出码区分结果：有差异退出 1，无差异退出 0",
+    )
 
     sub.add_parser("envs", help="列出库中已有直接设置的环境名")
 
@@ -542,6 +547,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    exit_code = EXIT_OK
     try:
         if args.command == "envs":
             # envs 不接收环境名或键名：只读输出环境名组成的单行 JSON 数组。
@@ -553,7 +559,14 @@ def main(argv=None):
             right = normalize_env(args.env_right)
             validate_env(left)
             validate_env(right)
-            result = json.dumps(cmd_diff(args.db, left, right), sort_keys=True)
+            diff = cmd_diff(args.db, left, right)
+            result = json.dumps(diff, sort_keys=True)
+            if args.exit_code and diff:
+                # --exit-code：完整比较发现差异时退出 1，无差异退出 0；
+                # stdout 的单行 JSON 与不加该参数时完全相同，stderr 为空。
+                # 不加该参数时，无论有无差异都退出 0。比较失败（错误码
+                # 经 FlagError 上报）统一退出 2，不输出部分差异。
+                exit_code = 1
         else:
             env = normalize_env(args.env)
             # 输入错误按环境名、键名、布尔值的顺序判断，
@@ -617,7 +630,7 @@ def main(argv=None):
         sys.stderr.write(exc.code + "\n")
         return EXIT_ERROR
     sys.stdout.write(result + "\n")
-    return EXIT_OK
+    return exit_code
 
 
 if __name__ == "__main__":
