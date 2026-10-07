@@ -120,19 +120,48 @@ def open_flag_store(db_path):
         conn.close()
 
 
-def cmd_set(db_path, env, key, value):
+def write_direct_settings(db_path, env, settings):
+    """set 与非空 import 共用的直接设置写入入口，两条入口的持久化
+    规则只在此维护一份。
+
+    settings 是 (键名, 存储文本) 对的序列，存储文本必须已由调用方
+    校验为严格的 "true" / "false"（set 经 parse_bool()，import 由
+    JSON 布尔映射），本函数不再做任何输入校验，校验失败的调用方在
+    触碰数据库之前就已返回：
+
+    * 创建缺失的数据库文件和 flags 表（CREATE TABLE IF NOT EXISTS），
+      但不创建父目录；
+    * INSERT OR REPLACE 按主键 (env, key) 覆盖同名旧值，false 也是
+      有效设置，其他环境及本次未提及的记录保持原样；
+    * 建表与全部写入处于同一个事务：set 是单行写入，非空 import 的
+      多行整体提交，任一 SQLite 错误都整体回滚、既有记录保持原样；
+    * 父目录不存在、目标不是有效数据库、flags 表缺少所需列或其他
+      任何 SQLite 错误统一报 STORAGE_ERROR。
+    """
     conn = connect(db_path)
     try:
-        with conn:
-            conn.execute(SCHEMA)
-            conn.execute(
-                "INSERT OR REPLACE INTO flags (env, key, value) VALUES (?, ?, ?)",
-                (env, key, value),
-            )
-    except sqlite3.Error:
-        raise FlagError("STORAGE_ERROR")
+        try:
+            with conn:
+                conn.execute(SCHEMA)
+                conn.executemany(
+                    "INSERT OR REPLACE INTO flags (env, key, value) "
+                    "VALUES (?, ?, ?)",
+                    [(env, key, value) for key, value in settings],
+                )
+        except sqlite3.Error:
+            raise FlagError("STORAGE_ERROR")
     finally:
         conn.close()
+
+
+def cmd_set(db_path, env, key, value):
+    """保存或覆盖一个直接设置，返回回显用的布尔文本。
+
+    环境名、键名与布尔文本由 main() 在访问存储前按序校验；建库建表、
+    同名覆盖、事务与 STORAGE_ERROR 分类等持久化规则与非空 import
+    完全共用 write_direct_settings()，这里不再单独维护一份。
+    """
+    write_direct_settings(db_path, env, ((key, value),))
     return value
 
 
@@ -289,29 +318,18 @@ def cmd_import(db_path, env, file_path):
 
     导入覆盖目标环境中出现的同名键，保留其他环境和文件中未出现的
     记录；false 是实际设置而非删除。空对象 {} 直接成功返回，不访问
-    数据库。非空导入沿用 set 的存储行为：创建缺失的数据库文件和
-    flags 表，但不创建父目录；父目录不存在、目标不是有效数据库、
-    flags 表缺少所需列或写入失败都报 STORAGE_ERROR，整个导入在
-    一个事务中完成，失败时既有记录保持原样。
+    数据库。非空导入的建库建表、同名覆盖、整事务提交/回滚与
+    STORAGE_ERROR 分类与 set 完全共用 write_direct_settings()，这里
+    只负责把解析出的 JSON 布尔值映射为存储文本 "true" / "false"。
     """
     data = load_import_file(file_path)
     if not data:
         return {}
-    conn = connect(db_path)
-    try:
-        with conn:
-            conn.execute(SCHEMA)
-            conn.executemany(
-                "INSERT OR REPLACE INTO flags (env, key, value) VALUES (?, ?, ?)",
-                [
-                    (env, key, "true" if data[key] else "false")
-                    for key in sorted(data)
-                ],
-            )
-    except sqlite3.Error:
-        raise FlagError("STORAGE_ERROR")
-    finally:
-        conn.close()
+    settings = [
+        (key, "true" if data[key] else "false")
+        for key in sorted(data)
+    ]
+    write_direct_settings(db_path, env, settings)
     return data
 
 
