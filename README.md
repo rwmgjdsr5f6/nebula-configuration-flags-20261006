@@ -42,7 +42,7 @@ stderr 均为空。
 
 ## 命令一览
 
-    python flagctl.py --db <库> set <环境> <键> <true|false>
+    python flagctl.py --db <库> set <环境> <键> <true|false> [--dry-run]
     python flagctl.py --db <库> get <环境> <键>
     python flagctl.py --db <库> unset <环境> <键>
     python flagctl.py --db <库> list <环境>
@@ -52,7 +52,16 @@ stderr 均为空。
     python flagctl.py --db <库> export <环境> <JSON 文件>
 
 - **set**：保存或覆盖一个直接设置，成功时 stdout 回显所写入的
-  `true` / `false`。
+  `true` / `false`。附加 `--dry-run` 时完全不写入，无需 JSON 文件即可
+  预览单键设置的变化：stdout 为单行 JSON 对象，有变化时形如
+  `{"new_ui":{"before":true,"after":false}}`，`before` 是目标 (环境, 键)
+  的原值（未设置用 `null`），`after` 是本次将写入的 JSON 布尔值；值相同
+  （含原值与新值都是 `false`）时输出 `{}`。预览严格按 **环境名 → 键名
+  → 布尔文本** 的顺序校验，全部通过后才读取存储；库文件缺失但父目录
+  存在、有效库缺 flags 表或目标记录缺失时原值视为 `null`，父目录缺失、
+  无效库、查询所需列缺失或目标记录值不是严格文本 `true`/`false` 时报
+  STORAGE_ERROR，不返回部分结果。其他环境和未知键记录不影响预览。预览
+  全程不创建目录、库文件或表，也不改动任何记录；重复调用得到相同结果。
 - **get**：读取一个直接设置，stdout 为 `true` 或 `false`。
 - **unset**：删除该环境该键的直接设置（删除整行记录，而不是写入
   `false`）；成功时 stdout 为 `unset`。
@@ -125,15 +134,17 @@ stderr 均为空。
 - value 列只保存严格文本 `true` 或 `false`；
 - 同一 (env, key) 再次 set 会覆盖旧行（INSERT OR REPLACE）；
 - **set 首次写入时**（以及非空 import 首次导入时）会创建缺失的
-  数据库文件并用 `CREATE TABLE IF NOT EXISTS` 建表；
+  数据库文件并用 `CREATE TABLE IF NOT EXISTS` 建表；附加 `--dry-run` 的
+  set 不写入，与下列只读命令一样不补建任何文件或表；
 - **get、unset、list、diff、envs 不补建任何文件或表**：库文件不存在
   或缺 flags 表时按下文的错误/空结果规则处理。
 
 ## 输出协议
 
 - **成功**：退出码 0；stderr 为空；stdout 为单行结果加换行。
-  set/get 输出布尔文本，unset 输出 `unset`，list/diff 输出一行
-  JSON 对象，envs 输出一行 JSON 数组。
+  set/get 输出布尔文本（set 附加 `--dry-run` 时输出一行 JSON 对象），
+  unset 输出 `unset`，list/diff 输出一行 JSON 对象，envs 输出一行
+  JSON 数组。
 - **失败**：退出码 2；stdout 为空；stderr 仅为错误码加换行，
   例如 `VALUE_NOT_SET`，不附带其他文本。
 
@@ -167,6 +178,10 @@ stderr 均为空。
 
 - set 严格按 **环境名 → 键名 → 布尔文本** 的顺序校验，任一失败都在
   访问存储之前拒绝，因此输入校验失败不会创建数据库文件或表。
+  `set --dry-run` 的校验顺序与错误码相同，全部通过后只做一次只读查询：
+  库文件缺失（父目录存在）、缺 flags 表或目标记录缺失按原值 `null`
+  预览，父目录缺失、无效库、所需列缺失或目标记录值不是严格文本
+  `true`/`false` 报 STORAGE_ERROR，不创建也不改动任何存储对象。
 - import 严格按 **环境名 → 读文件 → JSON 解析 → 全部键名 → 全部
   布尔值** 的顺序校验，全部通过后才访问数据库；校验失败不会创建
   数据库或表，也不会改动任何记录。非空导入在一个事务中写入，遇到

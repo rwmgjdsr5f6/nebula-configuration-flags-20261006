@@ -2,7 +2,7 @@
 """flagctl: 本地布尔功能开关命令行工具。
 
 用法:
-    python flagctl.py --db <数据库文件> set <环境名> <键名> <true|false>
+    python flagctl.py --db <数据库文件> set <环境名> <键名> <true|false> [--dry-run]
     python flagctl.py --db <数据库文件> get <环境名> <键名>
     python flagctl.py --db <数据库文件> unset <环境名> <键名>
     python flagctl.py --db <数据库文件> list <环境名>
@@ -147,6 +147,27 @@ def save_flags(db_path, env, items):
 def cmd_set(db_path, env, key, value):
     save_flags(db_path, env, [(key, value)])
     return value
+
+
+def preview_set(db_path, env, key, value):
+    """只读预览单个 set 将带来的变化，返回 {"before": .., "after": ..} 或 {}。
+
+    与 preview_import 一样只比较目标 (环境, 键) 的直接设置：before 是
+    该键已保存的 JSON 布尔值（未设置为 None），after 是本次将写入的
+    JSON 布尔值；值相同（含原值与新值都是 false）时返回 {}，不补默认
+    值或继承值，false 是有效设置、与未设置明确区分。
+
+    纯只读：复用 cmd_list 唯一一份存储分类与值校验——父目录存在但库
+    文件缺失、有效库缺 flags 表或目标记录缺失时原值视为 None；父目录
+    缺失、无效库、查询所需列缺失或目标记录值不是严格文本 true/false
+    时报 STORAGE_ERROR，不返回部分结果。其他环境及未知键的记录不影响
+    预览。不创建目录、库文件或表，不改动任何记录，重复调用结果相同。
+    """
+    after = value == "true"
+    before = cmd_list(db_path, env).get(key)
+    if before == after:
+        return {}
+    return {"before": before, "after": after}
 
 
 def cmd_get(db_path, env, key):
@@ -440,6 +461,11 @@ def build_parser():
     p_set.add_argument("env")
     p_set.add_argument("key")
     p_set.add_argument("value")
+    p_set.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只预览将发生的变化，不写入数据库",
+    )
 
     p_get = sub.add_parser("get", help="读取开关值")
     p_get.add_argument("env")
@@ -521,8 +547,20 @@ def main(argv=None):
             else:
                 validate_key(args.key)
                 if args.command == "set":
+                    # 环境名、键名、布尔文本全部校验通过后才访问存储；
+                    # --dry-run 只做只读预览，输出紧凑单行 JSON：有变化
+                    # 时为 {"键名":{"before":原值或null,"after":新值}}，
+                    # 值相同（含 false 覆盖 false）输出 {}，不写入存储；
+                    # 内层固定先 before 后 after，不用 sort_keys。
                     value = parse_bool(args.value)
-                    result = cmd_set(args.db, env, args.key, value)
+                    if args.dry_run:
+                        changes = preview_set(args.db, env, args.key, value)
+                        result = json.dumps(
+                            {args.key: changes} if changes else {},
+                            separators=(",", ":"),
+                        )
+                    else:
+                        result = cmd_set(args.db, env, args.key, value)
                 elif args.command == "unset":
                     result = cmd_unset(args.db, env, args.key)
                 else:
