@@ -76,6 +76,21 @@
   预览前后输入文件字节、库文件字节、完整记录与表结构均保持一致，
   qa 记录保留；所有失败均退出 2、stdout 为空、stderr 仅为错误码
   加换行，验收同时核对输出内容与调用后的文件状态。
+* import --dry-run 入口的输入拒绝顺序与文件保护回归：库路径父目录
+  不存在时，纯空白环境名搭配不存在的输入文件只报 EMPTY_ENV，合法
+  环境名搭配不存在的文件只报 IMPORT_READ_ERROR；{"other_key":NaN}
+  只报 INVALID_JSON（非标准 JSON 常量的拒绝先于键名校验），
+  {"new_ui":"false","other_key":true} 只报 UNKNOWN_KEY（全部键名
+  检查先于布尔值检查），仅含 {"new_ui":"false"} 只报 INVALID_BOOL
+  （字符串不能当作布尔值）；这些输入错误都先于存储访问，不被
+  STORAGE_ERROR 取代，每次失败退出 2、stdout 为空、stderr 仅为
+  错误码加换行，缺失的父目录与库文件仍不存在、已有输入文件字节
+  原样保留。另用有效 demo.sqlite（dev/new_ui=true、qa/new_ui=false）
+  做连续对照：candidate.json 中的 {"new_ui":"false"} 预览 dev 报
+  INVALID_BOOL，改写为 {"new_ui":false} 后预览退出 0、stderr 为空、
+  stdout 为 {"new_ui":{"before":true,"after":false}} 加换行；两次
+  调用均不改变完整记录、表结构、库文件字节与各自的输入文件，预览后
+  dev 仍为 true、qa 仍为 false。
 * export 把单环境已保存的直接设置导出为 JSON 文件：固定样例
   dev/new_ui=false、qa/new_ui=true 导出 dev 得到 {"new_ui": false}，
   stdout 与文件同为单行 JSON 加换行（无 BOM），再导入另一库的
@@ -2823,6 +2838,197 @@ class TestImportDryRunPreview(FlagctlCliTestCase):
                 ("qa", "other_key", "maybe"),
             ],
         )
+
+
+class TestImportDryRunRejectionOrder(FlagctlCliTestCase):
+    """import --dry-run 输入拒绝顺序与文件保护的命令行回归测试。
+
+    所有用例都通过 ``python flagctl.py --db <本地库> import <环境>
+    <文件> --dry-run`` 公开入口在独立进程中验证：库路径父目录不存在
+    时，EMPTY_ENV（纯空白环境名，即使输入文件也不存在）与
+    IMPORT_READ_ERROR（合法环境名但文件不存在）仍按环境名 -> 读文件
+    的顺序报告；可读文件的内容校验按 JSON 解析（含 NaN 等非标准常量，
+    先于键名校验）-> 全部键名（先于布尔值校验）-> 布尔值的顺序报告
+    INVALID_JSON / UNKNOWN_KEY / INVALID_BOOL。这些输入错误全部先于
+    存储访问，不被 STORAGE_ERROR 取代：失败退出 2、stdout 为空、
+    stderr 仅为错误码加换行，缺失的父目录与库文件仍不存在，已有输入
+    文件字节保持原样。
+
+    最后用有效 demo.sqlite（dev/new_ui=true、qa/new_ui=false）做连续
+    对照：candidate.json 先写 {"new_ui":"false"} 预览报 INVALID_BOOL，
+    再改写为 {"new_ui":false} 预览成功，两次调用都不改动库的完整记录、
+    表结构、文件字节与各自的输入文件，预览后 dev 仍为 true、qa 仍为
+    false。
+    """
+
+    def preview_flags(self, db, env, file_path):
+        """在全新进程中执行 import <env> <file> --dry-run。"""
+        return self.run_flagctl(db, "import", env, file_path, "--dry-run")
+
+    def read_file_bytes(self, path):
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def write_candidate(self, content, name="candidate.json"):
+        """写入指定字节内容的导入文件（默认沿用固定文件名）。"""
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "wb") as fh:
+            fh.write(content)
+        return path
+
+    def make_demo_db(self):
+        """固定样例库 demo.sqlite：dev/new_ui=true、qa/new_ui=false。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "false"), "false")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "false")],
+        )
+        return db
+
+    def missing_parent_db(self):
+        """返回父目录尚不存在的库路径，并确认父目录与库文件都不存在。"""
+        missing_dir = os.path.join(self.tmpdir, "no_such_parent")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+        self.assertFalse(os.path.exists(db))
+        return missing_dir, db
+
+    def assert_missing_storage_untouched(self, missing_dir, db):
+        """失败后缺失的父目录与库文件必须仍不存在（未发生存储访问）。"""
+        self.assertFalse(
+            os.path.exists(missing_dir), "输入校验失败不得创建缺失的父目录"
+        )
+        self.assertFalse(os.path.exists(db), "输入校验失败不得创建数据库文件")
+
+    def test_whitespace_env_rejected_before_missing_file_and_storage(self):
+        # 库路径父目录不存在，且输入文件也不存在：纯空白环境名只报
+        # EMPTY_ENV——环境名校验先于读文件与存储访问，不降级为
+        # IMPORT_READ_ERROR 或 STORAGE_ERROR。
+        missing_dir, db = self.missing_parent_db()
+        missing_file = os.path.join(self.tmpdir, "no_such_settings.json")
+        self.assertFalse(os.path.exists(missing_file))
+
+        proc = self.preview_flags(db, "   ", missing_file)
+
+        self.assertCommandError(proc, "EMPTY_ENV")
+        self.assertFalse(os.path.exists(missing_file), "失败不得创建输入文件")
+        self.assert_missing_storage_untouched(missing_dir, db)
+
+    def test_missing_input_file_reports_import_read_error_before_storage(self):
+        # 库路径父目录不存在：合法环境名搭配不存在的输入文件只报
+        # IMPORT_READ_ERROR——读文件先于存储访问，不降级为 STORAGE_ERROR。
+        missing_dir, db = self.missing_parent_db()
+        missing_file = os.path.join(self.tmpdir, "no_such_settings.json")
+        self.assertFalse(os.path.exists(missing_file))
+
+        proc = self.preview_flags(db, "dev", missing_file)
+
+        self.assertCommandError(proc, "IMPORT_READ_ERROR")
+        self.assertFalse(os.path.exists(missing_file), "失败不得创建输入文件")
+        self.assert_missing_storage_untouched(missing_dir, db)
+
+    def test_bare_constant_reports_invalid_json_before_key_and_storage(self):
+        # {"other_key": NaN}：非标准 JSON 常量 NaN 属于语法层面的非法
+        # JSON，只报 INVALID_JSON——该拒绝先于键名校验（不能因
+        # other_key 报 UNKNOWN_KEY），更先于存储访问。
+        missing_dir, db = self.missing_parent_db()
+        content = b'{"other_key":NaN}'
+        candidate = self.write_candidate(content, name="constant.json")
+
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandError(proc, "INVALID_JSON")
+        self.assertEqual(self.read_file_bytes(candidate), content)
+        self.assert_missing_storage_untouched(missing_dir, db)
+
+    def test_all_keys_checked_before_bool_and_storage(self):
+        # {"new_ui":"false","other_key":true}：存在未知键 other_key，
+        # 同时 new_ui 的值是字符串；全部键名校验先于布尔值校验，只报
+        # UNKNOWN_KEY，不被 INVALID_BOOL 或 STORAGE_ERROR 取代。
+        missing_dir, db = self.missing_parent_db()
+        content = b'{"new_ui":"false","other_key":true}'
+        candidate = self.write_candidate(content, name="unknown_key.json")
+
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandError(proc, "UNKNOWN_KEY")
+        self.assertEqual(self.read_file_bytes(candidate), content)
+        self.assert_missing_storage_untouched(missing_dir, db)
+
+    def test_string_bool_reports_invalid_bool_before_storage(self):
+        # 仅含 {"new_ui":"false"}：键名合法，但字符串不是 JSON 布尔值，
+        # 只报 INVALID_BOOL——布尔值校验先于存储访问，不降级为
+        # STORAGE_ERROR。
+        missing_dir, db = self.missing_parent_db()
+        content = b'{"new_ui":"false"}'
+        candidate = self.write_candidate(content, name="string_bool.json")
+
+        proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandError(proc, "INVALID_BOOL")
+        self.assertEqual(self.read_file_bytes(candidate), content)
+        self.assert_missing_storage_untouched(missing_dir, db)
+
+    def test_valid_demo_db_invalid_then_valid_preview_leaves_everything_intact(self):
+        # 有效 demo.sqlite 上的连续对照：candidate.json 先写字符串值
+        # {"new_ui":"false"} 预览 dev，预期 INVALID_BOOL；改写为 JSON
+        # 布尔值 {"new_ui":false} 再预览，预期退出 0、stderr 为空、
+        # stdout 为单行 {"new_ui":{"before":true,"after":false}}。
+        # 两次调用都不改变完整记录、表结构、库文件字节与各自输入文件，
+        # 预览后 dev 仍为 true、qa 仍为 false。
+        db = self.make_demo_db()
+        candidate = os.path.join(self.tmpdir, "candidate.json")
+
+        # 第一次：字符串 "false" 被拒绝。
+        invalid_bytes = b'{"new_ui":"false"}'
+        with open(candidate, "wb") as fh:
+            fh.write(invalid_bytes)
+        db_before_invalid = self.read_file_bytes(db)
+
+        invalid_proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandError(invalid_proc, "INVALID_BOOL")
+        self.assertEqual(self.read_file_bytes(candidate), invalid_bytes)
+        self.assertEqual(
+            self.read_file_bytes(db),
+            db_before_invalid,
+            "失败的预览不得改动库文件字节",
+        )
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "false")],
+        )
+        self.assertEqual(self.read_table_names(db), ["flags"])
+        self.assertEqual(self.read_flags_columns(db), ["env", "key", "value"])
+
+        # 第二次：改写输入文件为合法布尔值后预览成功。
+        valid_bytes = b'{"new_ui":false}'
+        with open(candidate, "wb") as fh:
+            fh.write(valid_bytes)
+        db_before_valid = self.read_file_bytes(db)
+
+        valid_proc = self.preview_flags(db, "dev", candidate)
+
+        self.assertCommandOk(
+            valid_proc, '{"new_ui":{"before":true,"after":false}}'
+        )
+        self.assertEqual(self.read_file_bytes(candidate), valid_bytes)
+        self.assertEqual(
+            self.read_file_bytes(db),
+            db_before_valid,
+            "成功的预览不得改动库文件字节",
+        )
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "true"), ("qa", "new_ui", "false")],
+        )
+        self.assertEqual(self.read_table_names(db), ["flags"])
+        self.assertEqual(self.read_flags_columns(db), ["env", "key", "value"])
+        # 预览只读：dev 仍为 true，qa 仍为 false。
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "true")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
 
 
 class TestExport(FlagctlCliTestCase):
