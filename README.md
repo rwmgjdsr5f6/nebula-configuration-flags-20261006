@@ -43,7 +43,7 @@ stderr 均为空。
 ## 命令一览
 
     python flagctl.py --db <库> set <环境> <键> <true|false> [--dry-run]
-    python flagctl.py --db <库> get <环境> <键>
+    python flagctl.py --db <库> get <环境> <键> [--default true|false]
     python flagctl.py --db <库> unset <环境> <键> [--dry-run]
     python flagctl.py --db <库> list <环境>
     python flagctl.py --db <库> diff <环境左> <环境右> [--exit-code]
@@ -65,7 +65,20 @@ stderr 均为空。
   STORAGE_ERROR，不返回部分结果；其他环境和未知键记录不影响预览。
   预览全程不创建目录、库文件或表，也不改动任何记录，重复调用得到
   相同结果。
-- **get**：读取一个直接设置，stdout 为 `true` 或 `false`。
+- **get**：读取一个直接设置，stdout 为 `true` 或 `false`。可选的
+  `--default true|false` 只为本次读取提供默认值，不写入配置库，也不
+  影响其他环境或后续命令：目标已有直接设置时（含已保存的 `false`）
+  照常返回保存值；仅当目标没有直接设置（父目录存在但库文件缺失、
+  有效库缺 `flags` 表或目标记录不存在）时才输出该默认值，退出 0；
+  省略 `--default` 时这些情形仍报 VALUE_NOT_SET。父目录缺失、库
+  无效、查询所需列缺失、连接或查询失败以及目标行保存了严格文本
+  `true`/`false` 之外的值时默认值不生效，仍报 STORAGE_ERROR；其他
+  环境及未知键记录的异常值不影响目标读取。带 `--default` 的读取仍
+  按环境名 → 键名 → 默认值的顺序校验：空环境报 EMPTY_ENV、未知键
+  报 UNKNOWN_KEY、默认值不是严格小写 `true`/`false`（含空串、
+  `TRUE`、`1`、带空白）报 INVALID_BOOL，即使目标已有设置也先完成
+  默认值校验，全部通过后才访问存储。get 全程不创建目录、库文件或
+  表，也不修改或修复记录。
 - **unset**：删除该环境该键的直接设置（删除整行记录，而不是写入
   `false`）；成功时 stdout 为 `unset`。附加 `--dry-run` 时完全不删除，
   只在正式删除前只读预览这一个键将发生的变化：stdout 为单行紧凑 JSON

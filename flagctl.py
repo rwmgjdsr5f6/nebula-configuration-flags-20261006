@@ -3,7 +3,7 @@
 
 用法:
     python flagctl.py --db <数据库文件> set <环境名> <键名> <true|false> [--dry-run]
-    python flagctl.py --db <数据库文件> get <环境名> <键名>
+    python flagctl.py --db <数据库文件> get <环境名> <键名> [--default true|false]
     python flagctl.py --db <数据库文件> unset <环境名> <键名> [--dry-run]
     python flagctl.py --db <数据库文件> list <环境名>
     python flagctl.py --db <数据库文件> diff <环境名左> <环境名右> [--exit-code]
@@ -173,19 +173,38 @@ def cmd_set(db_path, env, key, value, dry_run=False):
     return value
 
 
-def cmd_get(db_path, env, key):
+def cmd_get(db_path, env, key, default=None):
     """读取目标记录的布尔值，纯只读、不修复异常数据。
 
-    目标记录不存在报 VALUE_NOT_SET；记录存在但值不是严格的文本
-    true/false 时与 list/envs 走同一份校验（stored_bool_text()），
-    视为存储数据损坏，报 STORAGE_ERROR：不做大小写转换、不去除空白、
-    不输出原值。只检查目标记录，其他环境的异常值不在本次读取范围内。
+    目标记录存在时返回其严格文本值（false 也是有效设置，照常返回）；
+    记录存在但值不是严格的文本 true/false 时与 list/envs 走同一份校验
+    （stored_bool_text()），视为存储数据损坏，报 STORAGE_ERROR：不做
+    大小写转换、不去除空白、不输出原值。只检查目标记录，其他环境及
+    未知键记录的异常值不在本次读取范围内。
+
+    default 非 None（已由调用方用 parse_bool() 校验为严格文本
+    "true"/"false"）时，它只作用于本次调用、不写入存储：目标没有
+    直接设置（库文件缺失但父目录存在、有效库缺 flags 表或目标行不
+    存在）时返回该默认值，替代原本的 VALUE_NOT_SET；父目录缺失、
+    无效库、所需列缺失、连接或查询失败以及目标行值非法等
+    STORAGE_ERROR 不用默认值掩盖，仍原样上报。default 为 None 时
+    行为与不提供 --default 完全一致。
     """
-    with open_flag_store(db_path) as conn:
-        row = conn.execute(
-            "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
-        ).fetchone()
+    try:
+        with open_flag_store(db_path) as conn:
+            row = conn.execute(
+                "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
+            ).fetchone()
+    except FlagError as exc:
+        # 默认值只兜底“没有直接设置”：库文件缺失但父目录存在、有效库
+        # 缺 flags 表等 VALUE_NOT_SET 信号翻译为本次调用的默认值；
+        # STORAGE_ERROR 不用默认值掩盖。
+        if exc.code == "VALUE_NOT_SET" and default is not None:
+            return default
+        raise
     if row is None:
+        if default is not None:
+            return default
         raise FlagError("VALUE_NOT_SET")
     return stored_bool_text(row[0])
 
@@ -506,6 +525,12 @@ def build_parser():
     p_get = sub.add_parser("get", help="读取开关值")
     p_get.add_argument("env")
     p_get.add_argument("key")
+    p_get.add_argument(
+        "--default",
+        default=None,
+        help="目标没有直接设置时本次读取使用的默认值（严格小写 true/false），"
+        "不写入配置库",
+    )
 
     p_unset = sub.add_parser("unset", help="撤销开关的直接设置")
     p_unset.add_argument("env")
@@ -626,7 +651,14 @@ def main(argv=None):
                     else:
                         result = cmd_unset(args.db, env, args.key)
                 else:
-                    result = cmd_get(args.db, env, args.key)
+                    # get 在环境名、键名之后校验 --default：严格小写
+                    # true/false，空串、TRUE、1、带空白等一律 INVALID_BOOL。
+                    # 即使目标已有直接设置也先完成默认值校验，全部通过后
+                    # 才访问存储；默认值只影响本次读取，不持久化。
+                    default = None
+                    if args.default is not None:
+                        default = parse_bool(args.default)
+                    result = cmd_get(args.db, env, args.key, default)
     except FlagError as exc:
         sys.stderr.write(exc.code + "\n")
         return EXIT_ERROR
