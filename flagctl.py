@@ -3,7 +3,7 @@
 
 用法:
     python flagctl.py --db <数据库文件> set <环境名> <键名> <true|false> [--dry-run]
-    python flagctl.py --db <数据库文件> get <环境名> <键名> [--default true|false]
+    python flagctl.py --db <数据库文件> get <环境名> <键名> [--default true|false] [--explain]
     python flagctl.py --db <数据库文件> unset <环境名> <键名> [--dry-run]
     python flagctl.py --db <数据库文件> list <环境名>
     python flagctl.py --db <数据库文件> diff <环境名左> <环境名右> [--exit-code]
@@ -173,6 +173,33 @@ def cmd_set(db_path, env, key, value, dry_run=False):
     return value
 
 
+def read_flag_with_source(db_path, env, key, default=None):
+    """读取目标记录并说明值的来源，get 与 get --explain 共用的唯一规则。
+
+    返回 (严格文本 "true"/"false", 来源)：目标记录存在合法值时来源为
+    "direct"（false 也是直接设置，照常返回）；目标没有直接设置且调用方
+    提供了合法默认值时来源为 "default"。存储分类、默认值兜底范围与
+    cmd_get() 完全一致，只是把来源一并交给调用方决定输出形式。
+    """
+    try:
+        with open_flag_store(db_path) as conn:
+            row = conn.execute(
+                "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
+            ).fetchone()
+    except FlagError as exc:
+        # 默认值只兜底“没有直接设置”：库文件缺失但父目录存在、有效库
+        # 缺 flags 表等 VALUE_NOT_SET 信号翻译为本次调用的默认值；
+        # STORAGE_ERROR 不用默认值掩盖。
+        if exc.code == "VALUE_NOT_SET" and default is not None:
+            return default, "default"
+        raise
+    if row is None:
+        if default is not None:
+            return default, "default"
+        raise FlagError("VALUE_NOT_SET")
+    return stored_bool_text(row[0]), "direct"
+
+
 def cmd_get(db_path, env, key, default=None):
     """读取目标记录的布尔值，纯只读、不修复异常数据。
 
@@ -190,23 +217,21 @@ def cmd_get(db_path, env, key, default=None):
     STORAGE_ERROR 不用默认值掩盖，仍原样上报。default 为 None 时
     行为与不提供 --default 完全一致。
     """
-    try:
-        with open_flag_store(db_path) as conn:
-            row = conn.execute(
-                "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
-            ).fetchone()
-    except FlagError as exc:
-        # 默认值只兜底“没有直接设置”：库文件缺失但父目录存在、有效库
-        # 缺 flags 表等 VALUE_NOT_SET 信号翻译为本次调用的默认值；
-        # STORAGE_ERROR 不用默认值掩盖。
-        if exc.code == "VALUE_NOT_SET" and default is not None:
-            return default
-        raise
-    if row is None:
-        if default is not None:
-            return default
-        raise FlagError("VALUE_NOT_SET")
-    return stored_bool_text(row[0])
+    value, _source = read_flag_with_source(db_path, env, key, default)
+    return value
+
+
+def cmd_get_explained(db_path, env, key, default=None):
+    """get --explain：在同一次只读读取中返回值与来源。
+
+    校验顺序、默认值规则、存储分类与错误码与 cmd_get() 完全一致，只是
+    成功时返回 {"value": JSON 布尔值, "source": "direct"/"default"}：
+    目标存在合法记录（含 false、保存值等于默认值）时来源为 direct；
+    目标无直接设置且提供了合法默认值时来源为 default。默认值不落库，
+    读取不创建目录、库文件或表，也不修改或修复记录。
+    """
+    text, source = read_flag_with_source(db_path, env, key, default)
+    return {"value": text == "true", "source": source}
 
 
 def preview_unset(db_path, env, key):
@@ -531,6 +556,12 @@ def build_parser():
         help="目标没有直接设置时本次读取使用的默认值（严格小写 true/false），"
         "不写入配置库",
     )
+    p_get.add_argument(
+        "--explain",
+        action="store_true",
+        help="输出仅含 value 和 source 的单行 JSON 对象：value 为 JSON "
+        "布尔值，source 为 direct（已保存值）或 default（使用默认值）",
+    )
 
     p_unset = sub.add_parser("unset", help="撤销开关的直接设置")
     p_unset.add_argument("env")
@@ -658,7 +689,17 @@ def main(argv=None):
                     default = None
                     if args.default is not None:
                         default = parse_bool(args.default)
-                    result = cmd_get(args.db, env, args.key, default)
+                    if args.explain:
+                        # --explain 复用同一次读取：成功时输出仅含 value 和
+                        # source 的紧凑单行 JSON 对象，value 为 JSON 布尔值，
+                        # source 区分直接设置（direct）与本次默认值（default）。
+                        # 省略该参数时仍输出原有布尔文本。
+                        result = json.dumps(
+                            cmd_get_explained(args.db, env, args.key, default),
+                            separators=(",", ":"),
+                        )
+                    else:
+                        result = cmd_get(args.db, env, args.key, default)
     except FlagError as exc:
         sys.stderr.write(exc.code + "\n")
         return EXIT_ERROR

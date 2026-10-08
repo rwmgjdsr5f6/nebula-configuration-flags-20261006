@@ -43,7 +43,7 @@ stderr 均为空。
 ## 命令一览
 
     python flagctl.py --db <库> set <环境> <键> <true|false> [--dry-run]
-    python flagctl.py --db <库> get <环境> <键> [--default true|false]
+    python flagctl.py --db <库> get <环境> <键> [--default true|false] [--explain]
     python flagctl.py --db <库> unset <环境> <键> [--dry-run]
     python flagctl.py --db <库> list <环境>
     python flagctl.py --db <库> diff <环境左> <环境右> [--exit-code]
@@ -78,7 +78,15 @@ stderr 均为空。
   报 UNKNOWN_KEY、默认值不是严格小写 `true`/`false`（含空串、
   `TRUE`、`1`、带空白）报 INVALID_BOOL，即使目标已有设置也先完成
   默认值校验，全部通过后才访问存储。get 全程不创建目录、库文件或
-  表，也不修改或修复记录。
+  表，也不修改或修复记录。附加 `--explain` 时，同一次只读读取的
+  stdout 改为仅含 `value` 和 `source` 的单行 JSON 对象加换行：
+  `value` 为 JSON 布尔值，`source` 只取 `direct`（目标存在合法记录，
+  含保存值为 `false` 或与默认值相同）或 `default`（目标无直接设置、
+  使用了本次提供的合法默认值），例如
+  `{"value":false,"source":"direct"}`。校验顺序、错误码、存储分类、
+  默认值不落库与只读副作用与不带 `--explain` 完全一致；目标无直接
+  设置且未提供默认值时仍报 VALUE_NOT_SET，失败协议不变。省略
+  `--explain` 时仍输出原有布尔文本。
 - **unset**：删除该环境该键的直接设置（删除整行记录，而不是写入
   `false`）；成功时 stdout 为 `unset`。附加 `--dry-run` 时完全不删除，
   只在正式删除前只读预览这一个键将发生的变化：stdout 为单行紧凑 JSON
@@ -172,8 +180,9 @@ stderr 均为空。
 ## 输出协议
 
 - **成功**：退出码 0；stderr 为空；stdout 为单行结果加换行。
-  set/get 输出布尔文本（set 附加 `--dry-run` 时为例外，输出紧凑的
-  单行 JSON 变化对象），unset 输出 `unset`（附加 `--dry-run` 时同为
+  set/get 输出布尔文本（set 附加 `--dry-run`、get 附加 `--explain`
+  时为例外，输出紧凑的单行 JSON：前者是变化对象，后者是仅含 `value`
+  和 `source` 的对象），unset 输出 `unset`（附加 `--dry-run` 时同为
   例外，输出紧凑的单行 JSON 变化对象），list/diff 输出一行
   JSON 对象，envs 输出一行 JSON 数组。唯一的例外是 diff 附加
   `--exit-code`：stdout/stderr 仍是同一份单行 JSON 与空 stderr，但

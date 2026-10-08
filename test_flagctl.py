@@ -270,6 +270,14 @@ class FlagctlCliTestCase(unittest.TestCase):
         """在全新进程中执行 get <env> <key> --default <default>。"""
         return self.run_flagctl(db, "get", env, key, "--default", default)
 
+    def get_flag_explain(self, db, env, key, default=None):
+        """在全新进程中执行 get <env> <key> [--default <d>] --explain。"""
+        args = ("get", env, key)
+        if default is not None:
+            args += ("--default", default)
+        args += ("--explain",)
+        return self.run_flagctl(db, *args)
+
     def unset_flag(self, db, env, key):
         return self.run_flagctl(db, "unset", env, key)
 
@@ -1248,6 +1256,257 @@ class TestGetDefaultValidationBeforeStorage(FlagctlCliTestCase):
             self.get_flag_default(db, "dev", "new_ui", "true"), "false"
         )
         self.assertEqual(self.read_flags_rows(db), after_set)
+
+
+class TestGetExplain(FlagctlCliTestCase):
+    """get --explain 的来源标注、输出协议、校验顺序与存储分类。
+
+    成功时 stdout 是仅含 value（JSON 布尔值）和 source（direct/default）
+    的单行 JSON 对象加换行，退出 0、stderr 为空；失败协议与不带
+    --explain 完全一致（退出 2、stdout 空、stderr 仅错误码加换行）。
+    读取全程只读：不创建目录、库文件或表，不修复记录，默认值不落库。
+    """
+
+    def assertExplainOk(self, proc, value, source):
+        """退出 0、stderr 空；stdout 为单行 {"value":..,"source":..} JSON。
+
+        字段顺序与空白不作要求，按解析后的对象核对，并确认 value 是
+        JSON 布尔值（而非字符串）、source 取值合法、整行以单一换行结尾。
+        """
+        self.assertEqual(
+            proc.returncode, 0, "期望退出码 0，实际 stderr: %r" % proc.stderr
+        )
+        self.assertEqual(proc.stderr, "")
+        self.assertTrue(
+            proc.stdout.endswith("\n"), "stdout 应以换行结尾: %r" % proc.stdout
+        )
+        line = proc.stdout[:-1]
+        self.assertEqual(line.count("\n"), 0, "stdout 应为单行 JSON: %r" % proc.stdout)
+        data = json.loads(line)
+        self.assertEqual(
+            set(data), {"value", "source"}, "只允许 value/source 两个字段"
+        )
+        self.assertIsInstance(data["value"], bool)
+        self.assertEqual(data, {"value": value, "source": source})
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
+    def test_fixed_sample_direct_false_and_default_true(self):
+        # 验收样例：dev/new_ui 预置 false、qa 无记录。dev 读回保存值并
+        # 标注 direct；qa 用本次默认值 true 并标注 default。
+        db = self.db_path("demo")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+
+        self.assertExplainOk(
+            self.get_flag_explain(db, "dev", "new_ui", "true"), False, "direct"
+        )
+        self.assertExplainOk(
+            self.get_flag_explain(db, "qa", "new_ui", "true"), True, "default"
+        )
+
+    def test_saved_true_and_false_both_direct(self):
+        # 保存值 true 与 false 都是直接设置；默认值相同或相反都不改变
+        # 来源标注。
+        db = self.db_path("saved_both")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+
+        self.assertExplainOk(
+            self.get_flag_explain(db, "dev", "new_ui", "true"), False, "direct"
+        )
+        self.assertExplainOk(
+            self.get_flag_explain(db, "dev", "new_ui", "false"), False, "direct"
+        )
+        self.assertExplainOk(
+            self.get_flag_explain(db, "qa", "new_ui", "false"), True, "direct"
+        )
+
+    def test_explain_without_default_on_saved_value(self):
+        # 不带 --default 的 --explain：已设置时照常标注 direct。
+        db = self.db_path("explain_no_default")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+        self.assertExplainOk(self.get_flag_explain(db, "dev", "new_ui"), True, "direct")
+
+    def test_unset_states_with_default_report_default_without_side_effects(self):
+        # 三种未设置情形（库文件缺失、缺 flags 表、目标行缺失）携带合法
+        # 默认值时标注 default；不创建文件或表、不落库，随后省略
+        # --default 的读取仍报 VALUE_NOT_SET。
+        missing = self.db_path("explain_missing_db")
+        self.assertFalse(os.path.exists(missing))
+        self.assertExplainOk(
+            self.get_flag_explain(missing, "dev", "new_ui", "true"), True, "default"
+        )
+        self.assertFalse(os.path.exists(missing), "explain 读取不得创建库文件")
+        self.assertCommandError(self.get_flag(missing, "dev", "new_ui"), "VALUE_NOT_SET")
+
+        notable = self.db_path("explain_no_table")
+        conn = sqlite3.connect(notable)
+        try:
+            with conn:
+                conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY)")
+        finally:
+            conn.close()
+        self.assertExplainOk(
+            self.get_flag_explain(notable, "dev", "new_ui", "false"),
+            False,
+            "default",
+        )
+        self.assertEqual(self.read_table_names(notable), ["notes"])
+
+        norow = self.db_path("explain_no_row")
+        self.assertCommandOk(self.set_flag(norow, "qa", "new_ui", "false"), "false")
+        self.assertExplainOk(
+            self.get_flag_explain(norow, "dev", "new_ui", "true"), True, "default"
+        )
+        self.assertEqual(self.read_flags_rows(norow), [("qa", "new_ui", "false")])
+
+    def test_unset_state_without_default_reports_value_not_set(self):
+        # 目标无直接设置且未提供默认值：即使带 --explain 也报
+        # VALUE_NOT_SET，stdout 为空。
+        db = self.db_path("explain_not_set")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        self.assertCommandError(
+            self.get_flag_explain(db, "dev", "new_ui"), "VALUE_NOT_SET"
+        )
+
+    def test_validation_order_env_key_default_before_storage(self):
+        # --explain 沿用环境名 -> 键名 -> 默认值 -> 存储的校验顺序。
+        db = self.db_path("explain_order")
+        self.assertCommandError(
+            self.get_flag_explain(db, "   ", "new_ui", "true"), "EMPTY_ENV"
+        )
+        self.assertCommandError(
+            self.get_flag_explain(db, "dev", "bad_key", "true"), "UNKNOWN_KEY"
+        )
+        for raw in ("", "TRUE", "1", " true", "true ", "True"):
+            with self.subTest(raw=raw):
+                self.assertCommandError(
+                    self.get_flag_explain(db, "dev", "new_ui", raw), "INVALID_BOOL"
+                )
+        self.assertFalse(os.path.exists(db), "校验失败不得创建库文件")
+
+    def test_invalid_default_rejected_even_with_saved_value(self):
+        # 即使目标已有合法直接设置，非法默认值也必须先拒绝。
+        for saved in ("true", "false"):
+            db = self.db_path("explain_bad_default_%s" % saved)
+            self.assertCommandOk(self.set_flag(db, "dev", "new_ui", saved), saved)
+            self.assertCommandError(
+                self.get_flag_explain(db, "dev", "new_ui", "TRUE"), "INVALID_BOOL"
+            )
+            self.assertEqual(
+                self.read_flags_rows(db), [("dev", "new_ui", saved)]
+            )
+
+    def test_storage_errors_not_masked_by_default(self):
+        # 父目录缺失、无效库、缺列、目标值非法：默认值不掩盖，统一
+        # STORAGE_ERROR，失败协议不变，异常数据原样保留。
+        missing_dir = os.path.join(self.tmpdir, "explain_no_parent")
+        nodb = os.path.join(missing_dir, "flags.sqlite")
+        self.assertCommandError(
+            self.get_flag_explain(nodb, "dev", "new_ui", "true"), "STORAGE_ERROR"
+        )
+        self.assertFalse(os.path.exists(missing_dir))
+
+        bad = self.db_path("explain_bad_file")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write("not a sqlite database\n")
+        self.assertCommandError(
+            self.get_flag_explain(bad, "dev", "new_ui", "true"), "STORAGE_ERROR"
+        )
+
+        nocol = self.db_path("explain_no_column")
+        conn = sqlite3.connect(nocol)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags (env TEXT NOT NULL, key TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.execute(
+                    "INSERT INTO flags (env, key) VALUES (?, ?)", ("dev", "new_ui")
+                )
+        finally:
+            conn.close()
+        self.assertCommandError(
+            self.get_flag_explain(nocol, "dev", "new_ui", "true"), "STORAGE_ERROR"
+        )
+
+        corrupt = self.db_path("explain_corrupt")
+        self.seed_flags_table(corrupt, [("dev", "new_ui", "yes")])
+        self.assertCommandError(
+            self.get_flag_explain(corrupt, "dev", "new_ui", "true"), "STORAGE_ERROR"
+        )
+        self.assertEqual(
+            self.read_flags_rows(corrupt), [("dev", "new_ui", "yes")]
+        )
+
+    def test_anomalies_in_other_env_and_unknown_key_do_not_affect_explain(self):
+        # 其他环境与未知键的异常记录不在读取范围内：目标 dev 已保存
+        # false 时标注 direct；qa 无合法记录时默认值标注 default。
+        db = self.db_path("explain_other_anomalies")
+        self.seed_flags_table(
+            db,
+            [
+                ("dev", "new_ui", "false"),
+                ("qa", "other_key", "maybe"),
+                ("stage", "new_ui", "yes"),
+            ],
+        )
+        self.assertExplainOk(
+            self.get_flag_explain(db, "dev", "new_ui", "true"), False, "direct"
+        )
+        self.assertExplainOk(
+            self.get_flag_explain(db, "qa", "new_ui", "true"), True, "default"
+        )
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [
+                ("dev", "new_ui", "false"),
+                ("qa", "other_key", "maybe"),
+                ("stage", "new_ui", "yes"),
+            ],
+        )
+
+    def test_env_case_sensitive_and_internal_whitespace_preserved(self):
+        # 环境名区分大小写并保留内部空白；两端空白在读前去除。
+        db = self.db_path("explain_env_names")
+        self.assertCommandOk(self.set_flag(db, "de v", "new_ui", "true"), "true")
+        self.assertExplainOk(
+            self.get_flag_explain(db, "de v", "new_ui", "false"), True, "direct"
+        )
+        # 去两端空白后仍命中内部带空格的同一条记录。
+        self.assertExplainOk(
+            self.get_flag_explain(db, "  de v  ", "new_ui", "false"), True, "direct"
+        )
+        # 大小写不同的环境是另一个目标：未设置，走默认值。
+        self.assertExplainOk(
+            self.get_flag_explain(db, "DE V", "new_ui", "false"), False, "default"
+        )
+
+    def test_without_explain_flag_keeps_plain_bool_output(self):
+        # 省略 --explain 时成功仍输出纯布尔文本，与新增功能前完全一致。
+        db = self.db_path("explain_plain_compat")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.get_flag(db, "dev", "new_ui"), "false")
+        self.assertCommandOk(
+            self.get_flag_default(db, "qa", "new_ui", "true"), "true"
+        )
+        self.assertCommandError(self.get_flag(db, "qa", "new_ui"), "VALUE_NOT_SET")
 
 
 class TestUnsetPersistence(FlagctlCliTestCase):
