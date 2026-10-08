@@ -257,25 +257,50 @@ def preview_unset(db_path, env, key):
 def cmd_unset(db_path, env, key, dry_run=False):
     """删除一个直接设置（删除整行而非写入 false），成功时回显 unset。
 
+    正式撤销与 --dry-run 遵守完全相同的目标数据有效性规则：先在同一
+    事务中只读取目标行，并用唯一一份规则 stored_bool_text() 校验，值
+    为严格文本 "true"/"false" 才删除整行；true 与 false 都是有效设置，
+    同样删除。目标行不存在（含库文件缺失、有效库缺 flags 表）报
+    VALUE_NOT_SET；目标行值为 yes、TRUE、1、空串、带空白等非严格
+    true/false 文本时报 STORAGE_ERROR，保留原值、不修复记录。flags
+    表缺少 env/key/value 列、库无效、父目录不存在、连接、查询或删除
+    失败也统一报 STORAGE_ERROR；任何失败都在提交前回滚，既有记录全部
+    保持原样，不补建目录、库文件或表。
+
     dry_run=True 时完全不删除，改为只读预览单键变化，输出只含该键的
     {"before": 当前布尔值, "after": None}：原值严格文本 true/false 时
     before 为对应 JSON 布尔值，after 为 null；目标行不存在（含库文件
     缺失、缺 flags 表）报 VALUE_NOT_SET，原值非法报 STORAGE_ERROR。
-    输入校验顺序、错误码与正式 unset 一致，全程不创建或改动任何存储
-    对象，也不修复异常值。
+    输入校验顺序、错误码与正式 unset 完全一致，全程不创建或改动任何
+    存储对象，也不修复异常值。
     """
     if dry_run:
         return preview_unset(db_path, env, key)
     with open_flag_store(db_path) as conn:
         # 不补建 flags 表：缺表与没有目标记录一样视为值未设置（由
-        # open_flag_store 统一分类）。直接按主键删除，以 rowcount 是否
-        # 为 0 区分记录是否存在，无论原值是 true 还是 false 都删除该行。
+        # open_flag_store 统一分类）。SELECT/DELETE 的 SQLite 错误同样
+        # 交由 open_flag_store 按唯一一份规则分类（缺表 VALUE_NOT_SET，
+        # 其余 STORAGE_ERROR），整个流程包在一个事务里：任一步失败都
+        # 在提交前回滚，不会留下已删除一半的现场。
         with conn:
+            # 先按主键只读取出目标行并做与 --dry-run（经 cmd_get ->
+            # stored_bool_text）完全相同的单行校验；只检查目标行，其他
+            # 环境及未知键记录的异常值不在读取范围内。值非法时
+            # stored_bool_text 抛 STORAGE_ERROR，此时 DELETE 尚未执行，
+            # 事务回滚，异常原值原样保留，不被修复或删除。
+            row = conn.execute(
+                "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
+            ).fetchone()
+            if row is None:
+                raise FlagError("VALUE_NOT_SET")
+            stored_bool_text(row[0])
             cur = conn.execute(
                 "DELETE FROM flags WHERE env = ? AND key = ?", (env, key)
             )
-    if cur.rowcount == 0:
-        raise FlagError("VALUE_NOT_SET")
+            if cur.rowcount == 0:
+                # SELECT 命中但 DELETE 未命中只可能来自并发删除竞态：
+                # 已没有可撤销的记录，按查无目标行报 VALUE_NOT_SET。
+                raise FlagError("VALUE_NOT_SET")
     return "unset"
 
 
