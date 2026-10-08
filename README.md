@@ -43,7 +43,7 @@ stderr 均为空。
 ## 命令一览
 
     python flagctl.py --db <库> set <环境> <键> <true|false> [--dry-run]
-    python flagctl.py --db <库> get <环境> <键> [--default true|false]
+    python flagctl.py --db <库> get <环境> <键> [--default true|false] [--explain]
     python flagctl.py --db <库> unset <环境> <键> [--dry-run]
     python flagctl.py --db <库> list <环境>
     python flagctl.py --db <库> diff <环境左> <环境右> [--exit-code]
@@ -79,6 +79,16 @@ stderr 均为空。
   `TRUE`、`1`、带空白）报 INVALID_BOOL，即使目标已有设置也先完成
   默认值校验，全部通过后才访问存储。get 全程不创建目录、库文件或
   表，也不修改或修复记录。
+- **get --explain**：附加 `--explain` 后，stdout 从布尔文本变为仅含
+  `value` 与 `source` 的单行 JSON 对象加换行，`value` 为 JSON 布尔
+  值，`source` 只取 `direct` 或 `default`：目标存在合法记录时（保存
+  值为 `false` 或恰好等于默认值也一样）输出保存值与 `direct`；目标
+  无直接设置且提供合法默认值时输出默认值与 `default`；无直接设置且
+  未提供默认值时报 VALUE_NOT_SET。校验顺序（环境名 → 键名 → 默认
+  值 → 存储）、错误码、退出码与存储分类与不带 `--explain` 的 get 完
+  全一致：STORAGE_ERROR 不被默认值掩盖，失败退出 2、stdout 为空、
+  stderr 仅为错误码加换行；默认值不落库，读取不创建目录、库文件或
+  表，也不修改记录。省略 `--explain` 时输出与错误语义保持原样。
 - **unset**：删除该环境该键的直接设置（删除整行记录，而不是写入
   `false`）；成功时 stdout 为 `unset`。附加 `--dry-run` 时完全不删除，
   只在正式删除前只读预览这一个键将发生的变化：stdout 为单行紧凑 JSON
