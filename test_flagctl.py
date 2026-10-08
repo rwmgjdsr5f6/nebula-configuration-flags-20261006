@@ -14,6 +14,25 @@
   文本逐一报 STORAGE_ERROR 且原值原样保留，合法 true/false 正常读取，
   只检查目标记录（其他环境的异常值不影响合法目标），flags 表缺少
   查询所需的 value 列时报 STORAGE_ERROR；
+* get --default 默认值读取的回归：父目录存在但库文件缺失、有效库缺
+  flags 表、表中没有目标记录这三种未设置情形，分别携带 true/false
+  默认值时 stdout 为对应布尔文本加换行、退出 0、stderr 为空，默认值
+  只作用于本次读取（不创建库文件或表、不新增记录，省略 --default
+  的同一读取仍报 VALUE_NOT_SET）；目标已保存 true 或 false 时即使
+  默认值相反也返回保存值，已保存的 false 不被当作未设置；固定验收
+  样例 demo.sqlite（尚不存在、父目录存在）先执行
+  get dev new_ui --default true 输出 true，再对同一库执行
+  get dev new_ui 退出 2、stdout 为空、stderr 仅为 VALUE_NOT_SET 加
+  换行，两次读取后库文件仍不存在；已有库读取前后表结构与全部记录
+  保持一致。校验严格按环境名 -> 键名 -> 默认值的顺序且先于存储
+  访问：空或全空白环境报 EMPTY_ENV、环境合法但键未知报 UNKNOWN_KEY、
+  默认值为空串/TRUE/1/带空白文本报 INVALID_BOOL（即使目标已有设置
+  也不忽略），父目录缺失时以上优先级不变；合法默认值遇到父目录缺失、
+  非 SQLite 文件、flags 表缺 value 列或目标值为 yes 时统一报
+  STORAGE_ERROR，不返回默认值、不修复原数据，其他环境及未知键记录
+  的异常值不影响目标读取。所有失败退出 2、stdout 为空、stderr 仅为
+  错误码加换行，缺失目录不被创建，既有文件字节、表结构与全部记录
+  保持原样；
 * unset 撤销已保存记录（原值 true 与 false 各一条固定样例）的输出
   协议：记录物理消失而非改成 false、环境名两端空白命中同一记录、
   重复撤销报 VALUE_NOT_SET 且不影响其他环境；
@@ -246,6 +265,10 @@ class FlagctlCliTestCase(unittest.TestCase):
 
     def get_flag(self, db, env, key):
         return self.run_flagctl(db, "get", env, key)
+
+    def get_flag_default(self, db, env, key, default):
+        """在全新进程中执行 get <env> <key> --default <default>。"""
+        return self.run_flagctl(db, "get", env, key, "--default", default)
 
     def unset_flag(self, db, env, key):
         return self.run_flagctl(db, "unset", env, key)
@@ -805,6 +828,426 @@ class TestGetStoredValueValidation(FlagctlCliTestCase):
 
         self.assertEqual(self.read_flags_columns(db), ["env", "key"])
         self.assertEqual(self.read_flags_env_key_rows(db), [("dev", "new_ui")])
+
+
+class TestGetDefaultOnUnsetStates(FlagctlCliTestCase):
+    """目标没有直接设置时 --default 兜底读取的输出协议与现场保持。
+
+    三种未设置情形（父目录存在但库文件缺失、有效库缺 flags 表、表中
+    没有目标记录）分别携带 true/false 默认值：stdout 为对应布尔文本加
+    换行、退出 0、stderr 为空。默认值只作用于本次读取——不创建库文件
+    或表、不新增记录，随后省略 --default 的同一读取仍报
+    VALUE_NOT_SET；已有库读取前后表结构与全部记录保持一致。
+    """
+
+    def create_db_without_flags_table(self, db):
+        """创建只含无关表 notes（含一行数据）的有效 SQLite 库。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+                )
+                conn.execute("INSERT INTO notes (text) VALUES ('sample note')")
+        finally:
+            conn.close()
+
+    def read_notes_rows(self, db):
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute("SELECT id, text FROM notes ORDER BY id").fetchall()
+        finally:
+            conn.close()
+
+    def assert_unset_state_serves_default_once(
+        self, label, default, prepare, expected_missing_file
+    ):
+        """同一种未设置状态下：带默认值成功返回，省略默认值仍报
+        VALUE_NOT_SET，存储现场（文件缺失或既有表结构与记录）不变。"""
+        db = self.db_path(label)
+        prepare(db)
+
+        served = self.get_flag_default(db, "dev", "new_ui", default)
+        self.assertCommandOk(served, default)
+
+        if expected_missing_file:
+            self.assertFalse(
+                os.path.exists(db), "默认值读取不得创建数据库文件: %s" % db
+            )
+        plain = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandError(plain, "VALUE_NOT_SET")
+        if expected_missing_file:
+            self.assertFalse(
+                os.path.exists(db), "普通读取同样不得创建数据库文件: %s" % db
+            )
+
+    def test_missing_db_file_serves_true_or_false_without_creating_file(self):
+        # 父目录存在但库文件缺失：两种默认值都只兜底本次读取，两次
+        # 读取（含随后省略 --default 的对照）后库文件仍不存在。
+        for default in ("true", "false"):
+            with self.subTest(default=default):
+                self.assert_unset_state_serves_default_once(
+                    "get_default_missing_db_%s" % default,
+                    default,
+                    lambda db: self.assertFalse(os.path.exists(db)),
+                    True,
+                )
+
+    def test_db_without_flags_table_serves_default_without_creating_table(self):
+        # 有效库缺 flags 表：默认值照常生效，但不新增 flags 表，无关表
+        # notes 与其数据在读取前后保持一致；省略 --default 仍报
+        # VALUE_NOT_SET。
+        for default in ("true", "false"):
+            with self.subTest(default=default):
+                db = self.db_path("get_default_no_table_%s" % default)
+                self.create_db_without_flags_table(db)
+                self.assertEqual(self.read_table_names(db), ["notes"])
+
+                served = self.get_flag_default(db, "dev", "new_ui", default)
+                self.assertCommandOk(served, default)
+
+                self.assertEqual(self.read_table_names(db), ["notes"])
+                self.assertEqual(self.read_notes_rows(db), [(1, "sample note")])
+
+                plain = self.get_flag(db, "dev", "new_ui")
+                self.assertCommandError(plain, "VALUE_NOT_SET")
+                self.assertEqual(self.read_table_names(db), ["notes"])
+                self.assertEqual(self.read_notes_rows(db), [(1, "sample note")])
+
+    def test_missing_target_row_serves_default_without_inserting_row(self):
+        # flags 表只有 qa/new_ui=false：读缺失的 dev/new_ui 时两种
+        # 默认值都生效，但不新增 dev 记录，qa 的 false 原样保留。
+        for default in ("true", "false"):
+            with self.subTest(default=default):
+                db = self.db_path("get_default_no_row_%s" % default)
+                self.assertCommandOk(
+                    self.set_flag(db, "qa", "new_ui", "false"), "false"
+                )
+                self.assertEqual(
+                    self.read_flags_rows(db), [("qa", "new_ui", "false")]
+                )
+
+                served = self.get_flag_default(db, "dev", "new_ui", default)
+                self.assertCommandOk(served, default)
+
+                self.assertEqual(
+                    self.read_flags_rows(db), [("qa", "new_ui", "false")]
+                )
+
+                plain = self.get_flag(db, "dev", "new_ui")
+                self.assertCommandError(plain, "VALUE_NOT_SET")
+                self.assertEqual(
+                    self.read_flags_rows(db), [("qa", "new_ui", "false")]
+                )
+                self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+    def test_fixed_sample_default_does_not_persist_on_fresh_demo_db(self):
+        # 固定验收样例：尚不存在且父目录存在的 demo.sqlite。
+        # get dev new_ui --default true 输出 true；随后对同一库执行不带
+        # 默认值的 get dev new_ui 退出 2、stdout 为空、stderr 仅为
+        # VALUE_NOT_SET 加换行；两次读取后库文件仍不存在。
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(db))
+
+        first = self.run_flagctl(db, "get", "dev", "new_ui", "--default", "true")
+        self.assertCommandOk(first, "true")
+        self.assertFalse(os.path.exists(db), "默认值读取不得创建 demo.sqlite")
+
+        second = self.get_flag(db, "dev", "new_ui")
+        self.assertCommandError(second, "VALUE_NOT_SET")
+        self.assertFalse(os.path.exists(db), "两次读取后 demo.sqlite 仍不得存在")
+
+
+class TestGetDefaultPrefersSavedValue(FlagctlCliTestCase):
+    """目标已有直接设置时 --default 不参与结果，false 不被当作未设置。
+
+    已保存 true 或 false 时，即使默认值与保存值相反也返回保存值；
+    读取前后表结构与全部记录保持一致，默认值不被持久化，其他环境与
+    未知键记录原样保留。
+    """
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
+    def test_saved_false_returned_even_with_true_default(self):
+        # 关键语义：已保存的 false 是有效设置，不得被 --default true
+        # 覆盖，也不得被当成未设置。
+        db = self.db_path("get_default_saved_false")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+
+        proc = self.get_flag_default(db, "dev", "new_ui", "true")
+        self.assertCommandOk(proc, "false")
+
+        self.assertEqual(self.read_flags_columns(db), ["env", "key", "value"])
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "false")])
+        # 同值默认值不改变任何行为。
+        self.assertCommandOk(self.get_flag_default(db, "dev", "new_ui", "false"), "false")
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "false")])
+
+    def test_saved_true_returned_even_with_false_default(self):
+        db = self.db_path("get_default_saved_true")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "true"), "true")
+
+        proc = self.get_flag_default(db, "dev", "new_ui", "false")
+        self.assertCommandOk(proc, "true")
+
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "true")])
+        self.assertCommandOk(self.get_flag_default(db, "dev", "new_ui", "true"), "true")
+        self.assertEqual(self.read_flags_rows(db), [("dev", "new_ui", "true")])
+
+    def test_saved_target_value_preferred_while_other_rows_stay_intact(self):
+        # 多记录库：目标 dev/qa 各有设置并夹杂未知键行；相反默认值不
+        # 影响任一已保存目标，读取前后表结构与完整记录逐行一致。
+        db = self.db_path("get_default_mixed_rows")
+        self.seed_flags_table(
+            db,
+            [
+                ("dev", "new_ui", "true"),
+                ("qa", "new_ui", "false"),
+                ("dev", "other_key", "true"),
+            ],
+        )
+        before_columns = self.read_flags_columns(db)
+        before_rows = self.read_flags_rows(db)
+
+        self.assertCommandOk(
+            self.get_flag_default(db, "dev", "new_ui", "false"), "true"
+        )
+        self.assertCommandOk(
+            self.get_flag_default(db, "qa", "new_ui", "true"), "false"
+        )
+
+        self.assertEqual(self.read_flags_columns(db), before_columns)
+        self.assertEqual(self.read_flags_rows(db), before_rows)
+
+
+class TestGetDefaultValidationBeforeStorage(FlagctlCliTestCase):
+    """get --default 的输入校验顺序：环境名 -> 键名 -> 默认值 -> 存储。
+
+    空或全空白环境报 EMPTY_ENV，环境合法但键未知报 UNKNOWN_KEY，两者
+    合法后默认值为空串、TRUE、1 或带空白文本报 INVALID_BOOL；这些
+    优先级在父目录缺失时仍成立，目标已有设置时非法默认值也不能被
+    忽略。合法默认值遇到损坏存储时统一报 STORAGE_ERROR，不返回默认
+    值、不修复原数据。所有失败退出 2、stdout 为空、stderr 仅为错误
+    码加换行，缺失目录不被创建，既有文件字节、表结构与全部记录保持
+    原样。
+    """
+
+    INVALID_DEFAULTS = ["", "TRUE", "1", " true", "true ", " true ", "True", "yes"]
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
+    def test_empty_env_rejected_before_unknown_key_and_default(self):
+        # 环境名为空且键未知、默认值非法：唯一结果是 EMPTY_ENV。
+        for raw_default in ("true", "TRUE", ""):
+            with self.subTest(default=raw_default):
+                db = self.db_path("getd_order_env_%r" % raw_default)
+                proc = self.run_flagctl(
+                    db, "get", "   ", "bad_key", "--default", raw_default
+                )
+                self.assertCommandError(proc, "EMPTY_ENV")
+                self.assertFalse(os.path.exists(db))
+
+    def test_unknown_key_rejected_before_invalid_default(self):
+        # 环境合法、键未知：无论默认值合法与否都只报 UNKNOWN_KEY。
+        for raw_default in ("true", "TRUE", "1", ""):
+            with self.subTest(default=raw_default):
+                db = self.db_path("getd_order_key_%r" % raw_default)
+                proc = self.run_flagctl(
+                    db, "get", "dev", "other_key", "--default", raw_default
+                )
+                self.assertCommandError(proc, "UNKNOWN_KEY")
+                self.assertFalse(os.path.exists(db))
+
+    def test_invalid_default_rejected_on_fresh_path(self):
+        # 环境与键合法、默认值非法：报 INVALID_BOOL，且不创建库文件。
+        for raw_default in self.INVALID_DEFAULTS:
+            with self.subTest(default=raw_default):
+                db = self.db_path("getd_bad_default_fresh_%r" % raw_default)
+                proc = self.get_flag_default(db, "dev", "new_ui", raw_default)
+                self.assertCommandError(proc, "INVALID_BOOL")
+                self.assertFalse(os.path.exists(db), "校验失败不得创建数据库文件")
+
+    def test_invalid_default_rejected_even_when_target_is_saved(self):
+        # 目标已有直接设置（含 false）时非法默认值也必须先报错，绝不
+        # 因为保存值可读而忽略默认值校验；既有记录保持原样。
+        for saved in ("true", "false"):
+            for raw_default in ("", "TRUE", "1", " true"):
+                with self.subTest(saved=saved, default=raw_default):
+                    db = self.db_path(
+                        "getd_bad_default_saved_%s_%r" % (saved, raw_default)
+                    )
+                    self.assertCommandOk(
+                        self.set_flag(db, "dev", "new_ui", saved), saved
+                    )
+                    proc = self.get_flag_default(db, "dev", "new_ui", raw_default)
+                    self.assertCommandError(proc, "INVALID_BOOL")
+                    self.assertEqual(
+                        self.read_flags_rows(db), [("dev", "new_ui", saved)]
+                    )
+                    self.assertCommandOk(
+                        self.get_flag(db, "dev", "new_ui"), saved
+                    )
+
+    def test_input_error_priority_holds_with_missing_parent(self):
+        # 父目录缺失时输入校验优先级不变，不降级为 STORAGE_ERROR，且
+        # 缺失目录与库文件都不被创建。
+        missing_dir = os.path.join(self.tmpdir, "getd_missing_parent_dir")
+        db = os.path.join(missing_dir, "flags.sqlite")
+        self.assertFalse(os.path.exists(missing_dir))
+        cases = [
+            (["", "new_ui", "--default", "true"], "EMPTY_ENV"),
+            (["", "bad_key", "--default", "TRUE"], "EMPTY_ENV"),
+            (["dev", "other_key", "--default", "true"], "UNKNOWN_KEY"),
+            (["dev", "other_key", "--default", "TRUE"], "UNKNOWN_KEY"),
+            (["dev", "new_ui", "--default", ""], "INVALID_BOOL"),
+            (["dev", "new_ui", "--default", "TRUE"], "INVALID_BOOL"),
+            (["dev", "new_ui", "--default", "1"], "INVALID_BOOL"),
+            (["dev", "new_ui", "--default", " false "], "INVALID_BOOL"),
+        ]
+        for argv, code in cases:
+            with self.subTest(argv=argv, code=code):
+                proc = self.run_flagctl(db, "get", *argv)
+                self.assertCommandError(proc, code)
+                self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+                self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def assert_storage_error_not_masked_by_default(self, label, prepare, check):
+        """合法默认值遇到损坏存储：报 STORAGE_ERROR 而非返回默认值，
+        且存储现场保持原样。默认值 true/false 各核对一次。"""
+        for default in ("true", "false"):
+            with self.subTest(default=default):
+                db = self.db_path("%s_%s" % (label, default))
+                prepare(db)
+                proc = self.get_flag_default(db, "dev", "new_ui", default)
+                self.assertCommandError(proc, "STORAGE_ERROR")
+                check(db)
+
+    def test_missing_parent_directory_not_masked_by_default(self):
+        # 父目录不存在：合法默认值不兜底，目录与文件不被创建。
+        for default in ("true", "false"):
+            with self.subTest(default=default):
+                missing_dir = os.path.join(
+                    self.tmpdir, "getd_no_parent_dir_%s" % default
+                )
+                db = os.path.join(missing_dir, "flags.sqlite")
+                self.assertFalse(os.path.exists(missing_dir))
+                proc = self.get_flag_default(db, "dev", "new_ui", default)
+                self.assertCommandError(proc, "STORAGE_ERROR")
+                self.assertFalse(os.path.exists(missing_dir), "不得创建缺失的父目录")
+                self.assertFalse(os.path.exists(db), "不得创建数据库文件")
+
+    def test_non_sqlite_file_not_masked_by_default(self):
+        # 目标为普通文本文件：报 STORAGE_ERROR，文件字节原样保留。
+        def prepare(db):
+            with open(db, "w", encoding="utf-8") as fh:
+                fh.write("this is not a sqlite database\n")
+
+        def check(db):
+            with open(db, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "this is not a sqlite database\n")
+
+        self.assert_storage_error_not_masked_by_default(
+            "getd_plain_text", prepare, check
+        )
+
+    def test_flags_table_without_value_column_not_masked_by_default(self):
+        # flags 表缺 value 列：报 STORAGE_ERROR，表结构与既有行不变。
+        def prepare(db):
+            conn = sqlite3.connect(db)
+            try:
+                with conn:
+                    conn.execute(
+                        "CREATE TABLE flags ("
+                        "env TEXT NOT NULL, key TEXT NOT NULL, "
+                        "PRIMARY KEY (env, key))"
+                    )
+                    conn.execute(
+                        "INSERT INTO flags (env, key) VALUES (?, ?)",
+                        ("dev", "new_ui"),
+                    )
+            finally:
+                conn.close()
+
+        def check(db):
+            self.assertEqual(self.read_flags_columns(db), ["env", "key"])
+            self.assertEqual(self.read_flags_env_key_rows(db), [("dev", "new_ui")])
+
+        self.assert_storage_error_not_masked_by_default(
+            "getd_no_value_column", prepare, check
+        )
+
+    def test_corrupt_target_value_not_masked_by_default(self):
+        # 目标值为 yes：默认值不掩盖损坏，yes 不被修复，记录原样保留。
+        def prepare(db):
+            self.seed_flags_table(db, [("dev", "new_ui", "yes")])
+
+        def check(db):
+            self.assertEqual(
+                self.read_flags_rows(db), [("dev", "new_ui", "yes")]
+            )
+
+        self.assert_storage_error_not_masked_by_default(
+            "getd_target_yes", prepare, check
+        )
+
+    def test_anomalies_in_other_env_and_unknown_key_do_not_affect_default_read(self):
+        # 其他环境与未知键记录的异常值不在本次读取范围内：目标未设置
+        # 时默认值照常生效，目标已保存时保存值优先；异常行原样保留。
+        db = self.db_path("getd_other_anomalies")
+        self.seed_flags_table(
+            db,
+            [
+                ("qa", "new_ui", "yes"),
+                ("dev", "other_key", "maybe"),
+                ("qa", "other_key", ""),
+            ],
+        )
+        before = self.read_flags_rows(db)
+
+        # 目标 dev/new_ui 未设置：默认值生效，不被其他异常行干扰。
+        self.assertCommandOk(
+            self.get_flag_default(db, "dev", "new_ui", "true"), "true"
+        )
+        self.assertEqual(self.read_flags_rows(db), before)
+
+        # 写入目标 false 后，相反默认值仍返回保存值，异常行依旧保留。
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        after_set = self.read_flags_rows(db)
+        self.assertCommandOk(
+            self.get_flag_default(db, "dev", "new_ui", "true"), "false"
+        )
+        self.assertEqual(self.read_flags_rows(db), after_set)
 
 
 class TestUnsetPersistence(FlagctlCliTestCase):
