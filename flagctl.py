@@ -257,25 +257,39 @@ def preview_unset(db_path, env, key):
 def cmd_unset(db_path, env, key, dry_run=False):
     """删除一个直接设置（删除整行而非写入 false），成功时回显 unset。
 
+    正式撤销与 dry_run 预览遵守同一份目标数据有效性规则：先读取目标行
+    并交给唯一一份已保存值校验 stored_bool_text()，只有严格文本
+    true/false 的记录才会被删除；目标值是 yes、TRUE、1、空串或带空白
+    的布尔文本等非法值时报 STORAGE_ERROR，保留原值、不修复记录。目标
+    行不存在（含库文件缺失、缺 flags 表）报 VALUE_NOT_SET；flags 表缺
+    少 env、key 或 value 列，库无效、父目录不存在、连接、查询或删除
+    失败都报 STORAGE_ERROR，失败时全部既有记录保持原样。只检查目标行，
+    其他环境及未知键记录的异常值不影响合法目标的撤销。
+
     dry_run=True 时完全不删除，改为只读预览单键变化，输出只含该键的
     {"before": 当前布尔值, "after": None}：原值严格文本 true/false 时
-    before 为对应 JSON 布尔值，after 为 null；目标行不存在（含库文件
-    缺失、缺 flags 表）报 VALUE_NOT_SET，原值非法报 STORAGE_ERROR。
-    输入校验顺序、错误码与正式 unset 一致，全程不创建或改动任何存储
-    对象，也不修复异常值。
+    before 为对应 JSON 布尔值，after 为 null；错误码与存储分类和正式
+    unset 一致，全程不创建或改动任何存储对象，也不修复异常值。
     """
     if dry_run:
         return preview_unset(db_path, env, key)
     with open_flag_store(db_path) as conn:
         # 不补建 flags 表：缺表与没有目标记录一样视为值未设置（由
-        # open_flag_store 统一分类）。直接按主键删除，以 rowcount 是否
-        # 为 0 区分记录是否存在，无论原值是 true 还是 false 都删除该行。
+        # open_flag_store 统一分类）。读取、校验与删除在同一事务中完成：
+        # 先按主键读出目标行，不存在报 VALUE_NOT_SET；值必须通过与
+        # unset --dry-run 相同的严格校验（stored_bool_text），非法值报
+        # STORAGE_ERROR 且保留原值；校验通过才删除整行，无论原值是
+        # true 还是 false。任一步失败事务回滚，既有记录保持原样。
         with conn:
-            cur = conn.execute(
+            row = conn.execute(
+                "SELECT value FROM flags WHERE env = ? AND key = ?", (env, key)
+            ).fetchone()
+            if row is None:
+                raise FlagError("VALUE_NOT_SET")
+            stored_bool_text(row[0])
+            conn.execute(
                 "DELETE FROM flags WHERE env = ? AND key = ?", (env, key)
             )
-    if cur.rowcount == 0:
-        raise FlagError("VALUE_NOT_SET")
     return "unset"
 
 

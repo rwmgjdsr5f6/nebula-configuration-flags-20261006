@@ -88,7 +88,13 @@ stderr 均为空。
   设置且未提供默认值时仍报 VALUE_NOT_SET，失败协议不变。省略
   `--explain` 时仍输出原有布尔文本。
 - **unset**：删除该环境该键的直接设置（删除整行记录，而不是写入
-  `false`）；成功时 stdout 为 `unset`。附加 `--dry-run` 时完全不删除，
+  `false`）；成功时 stdout 为 `unset`。正式撤销与 `--dry-run` 预览
+  遵守相同的目标数据有效性规则：只删除保存为严格文本 `true` /
+  `false` 的目标行；目标行值不是严格文本 `true`/`false`（如 `yes`、
+  `TRUE`、`1`、空串或带空白的布尔文本）时报 STORAGE_ERROR，保留
+  原值、不修复记录；flags 表缺少 env、key 或 value 列，以及连接、
+  查询或删除失败同样报 STORAGE_ERROR，失败时全部既有记录保持原样。
+  附加 `--dry-run` 时完全不删除，
   只在正式删除前只读预览这一个键将发生的变化：stdout 为单行紧凑 JSON
   对象，形如 `{"new_ui":{"before":false,"after":null}}`，`before` 是目标
   行当前的严格文本值（`true` / `false` 映射为同名 JSON 布尔值），
@@ -210,7 +216,7 @@ stderr 均为空。
   有效 SQLite 库但缺少 flags 表时，也按此处理——查询不会顺手补建文件
   或表。
 - **STORAGE_ERROR**：父目录不存在；目标文件不是有效的 SQLite 数据库；
-  操作所需的表列缺失；以及 get、list、diff、envs、export 和
+  操作所需的表列缺失；以及 get、list、diff、envs、export、unset 和
   set/unset --dry-run 在目标范围内读到已知键保存了 `true` / `false`
   之外的非法值（数据损坏）。envs 的目标范围是全库：库中任一合法键的
   值非法都报此错，不输出部分名单。

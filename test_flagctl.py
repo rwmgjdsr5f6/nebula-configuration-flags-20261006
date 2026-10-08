@@ -78,9 +78,20 @@
   空或全空白环境报 EMPTY_ENV 且优先于 UNKNOWN_KEY，输入校验先于存储
   访问；预览不接收布尔值参数，多给位置参数由 argparse 拒绝；每次预览
   前后库文件字节、完整记录与表结构均保持一致，重复预览结果相同，不带
-  该选项的 unset 仍删除整行并输出 unset（原值非法也照常删除），重复
-  删除报 VALUE_NOT_SET；所有失败均退出 2、stdout 为空、stderr 仅为
-  错误码加换行；
+  该选项的 unset 对合法原值仍删除整行并输出 unset（原值非法则报
+  STORAGE_ERROR 并保留原值），重复删除报 VALUE_NOT_SET；所有失败均
+  退出 2、stdout 为空、stderr 仅为错误码加换行；
+* 正式 unset 与 unset --dry-run 遵守同一份目标数据有效性规则：固定
+  验收样例 demo.sqlite（标准 flags 表预置 dev/new_ui=yes 与
+  qa/new_ui=false）先执行 unset dev new_ui --dry-run、再执行去掉
+  --dry-run 的同一命令，两次都退出 2、stdout 为空、stderr 仅为
+  STORAGE_ERROR 加换行，全部记录不变；目标值为 yes、TRUE、1、空串
+  或带空白的布尔文本时正式撤销统一报 STORAGE_ERROR、保留原值、不
+  修复记录，flags 表缺少 env、key 或 value 列同样报 STORAGE_ERROR；
+  目标值为严格文本 false 的样例删除整行后 get 报 VALUE_NOT_SET；
+  只检查目标行，其他环境及未知键记录的异常值不影响合法目标撤销；
+  事务内删除失败报 STORAGE_ERROR 并回滚，全部既有记录保持原样，
+  解除失败条件后同一命令重试成功；
 * diff 只读比较两个环境的直接设置：固定样例 dev/new_ui=false、
   qa/new_ui=true 按输入顺序输出左右差异，交换顺序左右互换；相同
   布尔值、两侧都未设置与同一环境自比都返回 {}；一侧未设置对应值
@@ -1729,6 +1740,306 @@ class TestUnsetStorageStates(FlagctlCliTestCase):
             self.assertEqual(fh.read(), content)
 
 
+class TestUnsetStoredValueValidation(FlagctlCliTestCase):
+    """正式 unset 与 unset --dry-run 遵守同一份目标数据有效性规则。
+
+    修复的缺陷：过去 unset --dry-run 会拒绝目标记录中的非法布尔值，
+    而正式 unset 直接删除这样的记录并返回成功。现在正式撤销同样只
+    删除保存为严格文本 true/false 的目标行；目标值为 yes、TRUE、1、
+    空串或带空白的布尔文本时统一报 STORAGE_ERROR（退出 2、stdout
+    为空、stderr 严格为 ``STORAGE_ERROR\\n``），保留原值、不修复
+    记录。flags 表缺少 env、key 或 value 列也报 STORAGE_ERROR。只
+    检查目标行，其他环境及未知键记录的异常值不影响合法目标撤销。
+    """
+
+    def seed_flags_table(self, db, rows):
+        """直接建表并写入 (env, key, value) 行，绕过 set 的输入校验。"""
+        conn = sqlite3.connect(db)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE flags ("
+                    "env TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+                    "PRIMARY KEY (env, key))"
+                )
+                conn.executemany(
+                    "INSERT INTO flags (env, key, value) VALUES (?, ?, ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+
+    def test_fixed_sample_dry_run_and_formal_unset_both_reject_yes(self):
+        # 固定验收样例：标准 flags 表预置 dev/new_ui=yes、qa/new_ui=false。
+        # 先执行 unset dev new_ui --dry-run，再执行去掉 --dry-run 的同一
+        # 命令：两次都退出 2、stdout 为空、stderr 仅为 STORAGE_ERROR 加
+        # 换行，全部记录（含非法原值 yes）保持原样。
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "yes"), ("qa", "new_ui", "false")],
+        )
+        rows_before = self.read_flags_rows(db)
+        self.assertEqual(
+            rows_before, [("dev", "new_ui", "yes"), ("qa", "new_ui", "false")]
+        )
+        bytes_before = self.read_file_bytes(db)
+
+        preview = self.unset_preview(db, "dev", "new_ui")
+        self.assertCommandError(preview, "STORAGE_ERROR")
+
+        formal = self.unset_flag(db, "dev", "new_ui")
+        self.assertCommandError(formal, "STORAGE_ERROR")
+
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+        self.assertEqual(self.read_file_bytes(db), bytes_before)
+        self.assertEqual(self.read_table_names(db), ["flags"])
+        self.assertEqual(self.read_flags_columns(db), ["env", "key", "value"])
+        # 非法原值不被修复：get 仍报 STORAGE_ERROR，qa 的合法 false 正常。
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "STORAGE_ERROR")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "false")
+
+    def test_each_invalid_stored_text_reports_storage_error_and_keeps_row(self):
+        # yes、TRUE、1、空字符串、带空白的布尔文本均为非法存储值：正式
+        # unset 逐一报 STORAGE_ERROR，目标行（含非法原值）原样保留，
+        # 不做删除、转换或去空白。
+        invalid_values = ["yes", "TRUE", "1", "", " true", "true ", " true "]
+        for index, value in enumerate(invalid_values):
+            with self.subTest(value=value):
+                db = self.db_path("unset_bad_value_%d" % index)
+                self.seed_flags_table(
+                    db,
+                    [("dev", "new_ui", value), ("qa", "new_ui", "true")],
+                )
+
+                proc = self.unset_flag(db, "dev", "new_ui")
+                self.assertCommandError(proc, "STORAGE_ERROR")
+
+                self.assertEqual(
+                    self.read_flags_rows(db),
+                    [("dev", "new_ui", value), ("qa", "new_ui", "true")],
+                )
+                self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+    def test_valid_false_row_is_deleted_then_get_reports_value_not_set(self):
+        # 目标值为严格文本 false 的样例：正式 unset 退出 0、stdout 严格
+        # 为 "unset\n"、stderr 为空，整行物理删除；删除后 get 报
+        # VALUE_NOT_SET，另一环境记录不受影响。
+        db = self.db_path("unset_valid_false")
+        self.seed_flags_table(
+            db,
+            [("dev", "new_ui", "false"), ("qa", "new_ui", "true")],
+        )
+
+        removed = self.unset_flag(db, "dev", "new_ui")
+        self.assertCommandOk(removed, "unset")
+
+        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "true")])
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+    def test_flags_table_missing_columns_report_storage_error(self):
+        # flags 表缺少 env、key 或 value 列：正式 unset 均报
+        # STORAGE_ERROR，表结构与既有记录保持原样。
+        schemas = [
+            ("unset_no_value_col", "env TEXT NOT NULL, key TEXT NOT NULL, "
+             "PRIMARY KEY (env, key)", ("dev", "new_ui")),
+            ("unset_no_key_col", "env TEXT NOT NULL, value TEXT NOT NULL, "
+             "PRIMARY KEY (env, value)", ("dev", "true")),
+            ("unset_no_env_col", "key TEXT NOT NULL, value TEXT NOT NULL, "
+             "PRIMARY KEY (key, value)", ("new_ui", "true")),
+        ]
+        for label, columns, row in schemas:
+            with self.subTest(label=label):
+                db = self.db_path(label)
+                conn = sqlite3.connect(db)
+                try:
+                    with conn:
+                        conn.execute("CREATE TABLE flags (%s)" % columns)
+                        placeholders = ", ".join("?" * len(row))
+                        conn.execute(
+                            "INSERT INTO flags VALUES (%s)" % placeholders, row
+                        )
+                finally:
+                    conn.close()
+                bytes_before = self.read_file_bytes(db)
+
+                proc = self.unset_flag(db, "dev", "new_ui")
+                self.assertCommandError(proc, "STORAGE_ERROR")
+
+                self.assertEqual(self.read_file_bytes(db), bytes_before)
+
+    def test_anomalies_elsewhere_do_not_affect_legal_target_unset(self):
+        # 只检查目标行：qa/new_ui=yes 与未知键的异常记录不影响合法目标
+        # dev/new_ui=false 的撤销；撤销成功后异常记录原样保留。
+        db = self.db_path("unset_other_anomalies")
+        self.seed_flags_table(
+            db,
+            [
+                ("dev", "new_ui", "false"),
+                ("dev", "other_key", "maybe"),
+                ("qa", "new_ui", "yes"),
+            ],
+        )
+
+        removed = self.unset_flag(db, "dev", "new_ui")
+        self.assertCommandOk(removed, "unset")
+
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "other_key", "maybe"), ("qa", "new_ui", "yes")],
+        )
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+
+
+class TestUnsetDeleteFailureRollback(FlagctlCliTestCase):
+    """正式 unset 在事务内删除失败时的回滚与恢复重试回归。
+
+    固定样例：demo.sqlite 已有标准 flags 表，完整记录仅为
+    dev/new_ui=false 与 qa/new_ui=true。通过包装进程以与既有入口等价
+    的方式（同样的 --db ... unset dev new_ui 参数交给 flagctl.main()）
+    发起撤销，仅把 flagctl.connect 换成注入失败的版本：代理连接在
+    DELETE 实际落库之后、事务提交之前核对目标行已被删除且事务仍在
+    进行，把该时序证据写入证据文件（不满足时以退出码 99/98 让用例
+    明确失败，不允许用删除之前的失败代替），然后抛出
+    sqlite3.OperationalError 模拟删除失败。
+
+    失败调用退出 2、stdout 为空、stderr 仅为 STORAGE_ERROR 加换行；
+    重新打开数据库后 dev 仍为 false、qa 仍为 true，完整 flags 记录与
+    表结构与调用前一致。随后解除失败条件，用既有入口立即重试：退出
+    0、stderr 为空、stdout 为 unset 加换行，dev 行物理消失、qa 仍为
+    true。失败注入只发生在包装进程内，样例准备与正常重试按既有行为
+    执行。
+    """
+
+    # 包装脚本：以与 ``python flagctl.py --db ... unset dev new_ui``
+    # 等价的方式调用 flagctl.main()，仅把 flagctl.connect 换成注入
+    # 失败的版本。失败注入发生在 DELETE 落库之后、提交之前；脚本内
+    # 对此自查并留下证据文件，不满足时以 99/98 退出让用例明确失败。
+    WRAPPER_TEMPLATE = '''import os
+import sqlite3
+import sys
+
+sys.path.insert(0, {here!r})
+import flagctl
+
+EVIDENCE = os.environ["FLAGCTL_TEST_EVIDENCE"]
+
+real_connect = flagctl.connect
+
+
+class DeleteFailConnection(object):
+    """代理连接：DELETE 落库后、事务提交前注入 SQLite 删除失败。"""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+    def execute(self, sql, params=()):
+        cursor = self._conn.execute(sql, params)
+        if sql.lstrip().upper().startswith("DELETE"):
+            # 时序自查：目标行已在事务内删除且尚未提交；证据写入证据
+            # 文件供用例核对，不满足时以 99/98 退出让用例明确失败。
+            row = self._conn.execute(
+                "SELECT value FROM flags WHERE env = ? AND key = ?",
+                ("dev", "new_ui"),
+            ).fetchone()
+            in_transaction = self._conn.in_transaction
+            with open(EVIDENCE, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "row=%r in_transaction=%r\\n"
+                    % (row[0] if row else None, in_transaction)
+                )
+            if row is not None:
+                sys.exit(99)
+            if not in_transaction:
+                sys.exit(98)
+            raise sqlite3.OperationalError("simulated unset delete failure")
+        return cursor
+
+    def close(self):
+        self._conn.close()
+
+
+def failing_connect(db_path):
+    return DeleteFailConnection(real_connect(db_path))
+
+
+flagctl.connect = failing_connect
+
+sys.exit(flagctl.main())
+'''
+
+    def make_demo_db(self):
+        """固定样例库 demo.sqlite：dev/new_ui=false、qa/new_ui=true。"""
+        db = os.path.join(self.tmpdir, "demo.sqlite")
+        self.assertCommandOk(self.set_flag(db, "dev", "new_ui", "false"), "false")
+        self.assertCommandOk(self.set_flag(db, "qa", "new_ui", "true"), "true")
+        return db
+
+    def write_wrapper(self):
+        """在临时目录写入失败注入包装脚本并返回路径。"""
+        wrapper = os.path.join(self.tmpdir, "failing_unset.py")
+        with open(wrapper, "w", encoding="utf-8") as fh:
+            fh.write(self.WRAPPER_TEMPLATE.format(here=HERE))
+        return wrapper
+
+    def run_failing_unset(self, wrapper, db, evidence):
+        """在包装进程中执行 unset dev new_ui，注入事务内删除失败。"""
+        env = dict(os.environ)
+        env["FLAGCTL_TEST_EVIDENCE"] = evidence
+        return subprocess.run(
+            [sys.executable, wrapper, "--db", db, "unset", "dev", "new_ui"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+    def test_delete_failure_rolls_back_then_retry_succeeds(self):
+        db = self.make_demo_db()
+        wrapper = self.write_wrapper()
+        evidence = os.path.join(self.tmpdir, "evidence.txt")
+
+        rows_before = self.read_flags_rows(db)
+        cols_before = self.read_flags_columns(db)
+        self.assertEqual(
+            rows_before, [("dev", "new_ui", "false"), ("qa", "new_ui", "true")]
+        )
+        self.assertEqual(cols_before, ["env", "key", "value"])
+
+        proc = self.run_failing_unset(wrapper, db, evidence)
+
+        # 退出 2、stdout 为空、stderr 仅为 STORAGE_ERROR 加换行；若注入
+        # 发生在删除之前或事务已提交，包装进程会以 99/98 退出，下面的
+        # 断言随之失败。
+        self.assertCommandError(proc, "STORAGE_ERROR")
+
+        # 可核对的时序证据：失败发生时目标行已在事务内删除且尚未提交，
+        # 回滚验证确实涉及已发生的删除。
+        self.assertTrue(os.path.isfile(evidence), "注入点必须留下时序证据文件")
+        with open(evidence, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "row=None in_transaction=True\n")
+
+        # 回滚后重新打开数据库：dev 与 qa 的记录、表结构与调用前一致。
+        self.assertEqual(self.read_table_names(db), ["flags"])
+        self.assertEqual(self.read_flags_columns(db), cols_before)
+        self.assertEqual(self.read_flags_rows(db), rows_before)
+
+        # 解除失败条件，用既有入口立即重试：删除成功，dev 行物理消失。
+        retry = self.unset_flag(db, "dev", "new_ui")
+        self.assertCommandOk(retry, "unset")
+        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "true")])
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+        self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
+
+
 class TestUnsetDryRunPreview(FlagctlCliTestCase):
     """unset --dry-run 只读预览撤销变化的命令行回归测试。
 
@@ -1741,8 +2052,8 @@ class TestUnsetDryRunPreview(FlagctlCliTestCase):
     报 STORAGE_ERROR 且不输出部分结果、其他环境与未知键记录不影响预览、
     父目录缺失/普通文本文件/缺 value 列报 STORAGE_ERROR、环境名区分
     大小写并保留内部空白、重复预览结果相同，以及不带 --dry-run 的
-    unset 仍删除整行并回显 unset（原值非法也照常删除），重复删除报
-    VALUE_NOT_SET。
+    unset 对合法原值仍删除整行并回显 unset（原值非法则报
+    STORAGE_ERROR 并保留原值），重复删除报 VALUE_NOT_SET。
 
     每次预览前后都核对库文件字节、表结构与完整记录；失败一律
     退出 2、stdout 为空、stderr 仅为错误码加换行。
@@ -2086,18 +2397,22 @@ class TestUnsetDryRunPreview(FlagctlCliTestCase):
         self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
         self.assertCommandOk(self.get_flag(db, "qa", "new_ui"), "true")
 
-    def test_normal_unset_deletes_row_with_illegal_value(self):
-        # 正式 unset 不做值校验：目标原值非法（yes）也照常删除整行。
+    def test_normal_unset_rejects_row_with_illegal_value(self):
+        # 正式 unset 与 --dry-run 遵守同一份目标数据有效性规则：目标
+        # 原值非法（yes）时报 STORAGE_ERROR，整行（含非法原值）保留。
         db = self.db_path("unset_preview_then_real_bad_value")
         self.seed_flags_table(
             db,
             [("dev", "new_ui", "yes"), ("qa", "new_ui", "true")],
         )
 
-        removed = self.unset_flag(db, "dev", "new_ui")
-        self.assertCommandOk(removed, "unset")
-        self.assertEqual(self.read_flags_rows(db), [("qa", "new_ui", "true")])
-        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "VALUE_NOT_SET")
+        rejected = self.unset_flag(db, "dev", "new_ui")
+        self.assertCommandError(rejected, "STORAGE_ERROR")
+        self.assertEqual(
+            self.read_flags_rows(db),
+            [("dev", "new_ui", "yes"), ("qa", "new_ui", "true")],
+        )
+        self.assertCommandError(self.get_flag(db, "dev", "new_ui"), "STORAGE_ERROR")
 
     def test_repeated_normal_unset_reports_value_not_set(self):
         # 预览之后正式 unset 仍然删除；对已删除的行重复 unset 报
