@@ -1,0 +1,363 @@
+flagctl envs 环境发现流程说明
+============================
+
+本文说明 `python flagctl.py --db <库文件> envs` 从公开命令行入口到
+stdout 名单输出的完整路径，重点回答一个问题：为什么库中明明有记录的
+环境，仍可能不出现在 envs 名单里。本文只描述这一个流程的现有行为，
+每项关键结论均注明 flagctl.py 中的函数名与分支条件（附行号），可直接
+与源码核对；不新增命令、不改变任何公开行为，既有源码、README、SQLite
+表结构与其他命令的说明和行为均保持不变。
+
+本文样例均给出前置状态与源码依据。文内固定样例与边界样例已由作者在
+临时目录按所述前置状态实际建库运行核对；凡是未经运行、仅按源码推出的
+结论，均显式标注“推导预期”。
+
+一、入口与输出协议（main / build_parser）
+------------------------------------------
+
+envs 是不接收环境名或键名的子命令：build_parser() 中只有一行
+`sub.add_parser("envs", ...)`（flagctl.py:587），没有任何位置参数。
+因此 envs 不存在 EMPTY_ENV、UNKNOWN_KEY、INVALID_BOOL 这类输入校验
+环节——main() 中 normalize_env()/validate_env()/validate_key() 都在
+处理“其他命令”的分支里，envs 走的是独立的最前分支：
+
+    if args.command == "envs":
+        # 只读输出环境名组成的单行 JSON 数组。
+        result = json.dumps(cmd_envs(args.db), ensure_ascii=False)
+    ...
+    except FlagError as exc:
+        sys.stderr.write(exc.code + "\n")
+        return EXIT_ERROR          # EXIT_ERROR = 2（flagctl.py:28）
+    sys.stdout.write(result + "\n")
+    return exit_code               # 成功为 EXIT_OK = 0（flagctl.py:26）
+
+（flagctl.py:609-611、703-707）
+
+由此确定 envs 的全部对外协议只有两种：
+
+* 成功：退出码 0，stderr 为空，stdout 为单行 JSON 数组加换行
+  （`json.dumps(..., ensure_ascii=False)` 的结果再由 main 追加 "\n"）；
+  名单为空时即 `[]` 加换行。
+* 失败：退出码 2，stdout 为空，stderr 仅为错误码加换行。envs 唯一可能
+  上报的业务错误码是 STORAGE_ERROR（理由见第三、四节）。
+
+注意成功路径上的 stdout 写入发生在 cmd_envs() 完整返回之后
+（flagctl.py:706）。cmd_envs() 内部一旦抛 FlagError，就直接进入
+except 分支，main 不会执行 stdout 写入——因此任何失败都不会带出部分
+名单。
+
+二、关键区分：“有记录”不等于“有合法直接设置”
+-----------------------------------------------
+
+flags 表（结构见 SCHEMA，flagctl.py:30-37）中“某环境有行”只是有
+记录；envs 名单的准入条件更严格：该环境至少存在一行**已知键且存储值
+合法**的直接设置。cmd_envs() 的判定循环（flagctl.py:522-529）：
+
+    envs = set()
+    for env, key, value in rows:
+        if key not in KNOWN_KEYS:   # 未知键整行忽略
+            continue
+        stored_bool_text(value)     # 已知键：值非法即抛 STORAGE_ERROR
+        envs.add(env)
+    return sorted(envs)
+
+三条规则：
+
+1. 当前合法键只有 new_ui。KNOWN_KEYS 定义为
+   `frozenset({"new_ui"})`（flagctl.py:24）。只有 key 等于 "new_ui"
+   的行才可能让环境进入名单。
+
+2. true 与 false 都是合法直接设置。stored_bool_text()
+   （flagctl.py:71-84）只接受严格文本：
+
+       if value == "true" or value == "false":
+           return value
+       raise FlagError("STORAGE_ERROR")
+
+   不修剪空白、不转换大小写，也不接受 "TRUE"、"yes"、"1" 等写法。
+   "false" 与 "true" 走同一分支通过校验，循环随即执行 envs.add(env)。
+   因此值为 false 的环境必然出现——false 是已保存的设置，不能当作
+   未设置。
+
+3. 未知键的行不提供任何资格，也不受值校验。`key not in KNOWN_KEYS`
+   时 continue 发生在 stored_bool_text() 调用之前（flagctl.py:526-
+   527），所以：
+
+   * 只含未知键记录的环境（如只有 qa/other_key=yes）不会出现在名单；
+   * 未知键上即使存有非法值（"TRUE"、"!!!" 等任意文本），该行也被
+     整行跳过，既不会让环境入选，也不会触发 STORAGE_ERROR。
+
+三、完整路径：从公开入口到名单输出
+-----------------------------------
+
+一次 `... envs` 调用严格经过以下环节，前一环节抛错就不会有后续输出：
+
+  1. 参数解析（build_parser，flagctl.py:533-602）：要求 --db，envs 无
+     其他参数；参数层面的失败由 argparse 处理，不属于本流程的存储协议。
+  2. main() 的 envs 分支（flagctl.py:609-611）调用 cmd_envs(args.db)。
+  3. 打开存储（cmd_envs 经 open_flag_store，flagctl.py:514-516）：
+
+         with open_flag_store(db_path) as conn:
+             rows = conn.execute(
+                 "SELECT env, key, value FROM flags").fetchall()
+
+     注意这条 SELECT **没有 WHERE 子句**，一次取回全库所有行——这是
+     envs 与 get/list 的根本范围差异，详见第五节。
+  4. 存储状态分类（open_flag_store，flagctl.py:94-122；connect，
+     flagctl.py:87-91）：
+     - VALUE_NOT_SET（库文件缺失但父目录存在、有效库缺 flags 表）被
+       cmd_envs 翻译为空名单：
+
+           except FlagError as exc:
+               if exc.code == "VALUE_NOT_SET":
+                   return []
+               raise
+
+       （flagctl.py:517-521）
+     - 其余 STORAGE_ERROR 原样上抛，交由 main 按失败协议处理。
+  5. 逐行准入判定（flagctl.py:522-529，规则见第二节）：未知键跳过；
+     已知键调 stored_bool_text() 校验，任一非法立即抛
+     STORAGE_ERROR，已收集的名称全部丢弃；合法（含 false）则把 env
+     原样加入集合。
+  6. 去重与排序：return sorted(envs)（flagctl.py:530），规则见第六节。
+  7. 序列化与输出：main 用 json.dumps(..., ensure_ascii=False) 生成
+     单行 JSON 数组，成功后写入 stdout 并追加换行，退出码 0
+     （flagctl.py:611、706-707）。
+
+四、存储状态分类：哪些得到 []，哪些得到 STORAGE_ERROR
+------------------------------------------------------
+
+分类规则全部维护在 open_flag_store()（flagctl.py:94-122）一份中，
+cmd_envs 只负责把 VALUE_NOT_SET 翻译为 []：
+
+输出 [] 并退出 0（cmd_envs 捕获 VALUE_NOT_SET，flagctl.py:519-520）：
+
+* 父目录存在但库文件缺失。os.path.exists(db_path) 为假时，取
+  os.path.dirname(os.path.abspath(db_path))，父目录是目录
+  （os.path.isdir 为真）-> FlagError("VALUE_NOT_SET")
+  （flagctl.py:105-109）。
+* 有效库缺少 flags 表。查询抛 sqlite3.OperationalError 且信息含
+  "no such table" -> VALUE_NOT_SET（flagctl.py:114-117）。
+* 库中没有任何合法键记录（只有未知键的行，或 flags 表为空）。此情形
+  不抛错，循环结束后集合为空，sorted(set()) 即 []。
+* 实测补充：零字节文件在此被 SQLite 当作尚未初始化的空库处理，查询
+  flags 同样报 "no such table"，归入上一类 -> []。含非数据库内容的
+  文件才按下一条判为无效库（见样例九）。
+
+报 STORAGE_ERROR、退出 2、stdout 为空（统一失败协议）：
+
+* 库文件缺失且父目录不存在：os.path.isdir(parent) 为假
+  （flagctl.py:107-108）。
+* 连接失败：connect() 中 sqlite3.connect 抛 sqlite3.Error
+  （flagctl.py:87-91）。实测 --db 指向一个已存在的目录即在此失败。
+* 目标文件不是有效 SQLite 数据库：查询阶段抛 OperationalError 且信息
+  不含 "no such table"，或抛其他 sqlite3.Error
+  （flagctl.py:114-120）。
+* 查询所需列缺失：SELECT env, key, value FROM flags 要求 flags 表同时
+  具备 env/key/value 三列；缺任一列报 OperationalError（信息为
+  "no such column"，不匹配 "no such table" 分支）-> STORAGE_ERROR
+  （flagctl.py:114-118）。
+* 任一已知键的存储值不是严格文本 "true"/"false"：stored_bool_text()
+  抛 STORAGE_ERROR（flagctl.py:82-84），其全库触发范围见第五节。
+* 其他连接或查询失败（sqlite3.Error）：flagctl.py:119-120 兜底分支。
+
+以上整个过程只执行 SELECT：open_flag_store() 不运行 SCHEMA、不创建
+目录、库文件或 flags 表（对比写命令使用的 save_flags() 才会
+conn.execute(SCHEMA) 建表，flagctl.py:137；envs 不经过它），也不修复
+任何非法记录。
+
+五、全库校验范围：不要把单目标环境的规则搬到 envs
+---------------------------------------------------
+
+这是最容易误判之处。get/list 读取时带环境（甚至键）条件，作用域是单
+目标：
+
+* cmd_list()：`SELECT key, value FROM flags WHERE env = ?`
+  （flagctl.py:297-299），只遍历目标环境；
+* read_flag_with_source()：`... WHERE env = ? AND key = ?`
+  （flagctl.py:186-188），只取单条目标记录。
+
+所以 get/list 的说明里“其他环境及未知键记录的异常值不影响本次读取”
+成立——其他环境的行根本不在结果集里。
+
+envs 不同：cmd_envs() 的 SELECT 没有 WHERE（flagctl.py:516），
+stored_bool_text() 的校验覆盖**全库每一行已知键记录**，与调用方关心
+哪个环境无关：
+
+* 任意环境（包括你本来不打算查询的环境）的 new_ui 存有
+  "true"/"false" 之外的值，整个 envs 调用就在该行抛 STORAGE_ERROR，
+  名单完全不输出，而不是“跳过坏环境列出其余环境”。
+* 失败发生在循环中途时，先前已 envs.add() 的名称随异常一起丢弃；
+  main() 走 except 分支不写 stdout，因此不存在部分名单。
+* 豁免边界仍然只有“未知键”这一条：未知键行在值校验之前就被
+  continue（flagctl.py:526-527），其值再异常也不影响名单；一旦键名
+  属于 KNOWN_KEYS，无论属于哪个环境，值非法即全库失败。
+
+六、去重、排序与名称原样输出
+-----------------------------
+
+cmd_envs() 用集合收集、用 sorted() 返回（flagctl.py:522、530）：
+
+* 同名去重：envs 是 set，同一环境即使因多行记录被多次 add 也只出现
+  一次。注意 flags 表主键为 (env, key)（flagctl.py:35），同一环境的
+  new_ui 至多一行；重复资格通常来自该环境的其他行，但集合对任何来源
+  的重名一律去重。
+* 排序：sorted(envs) 使用 Python 默认字符串序，即按名称的 Unicode
+  码点逐码点升序，不做本地化排序、不按大小写不敏感排序。
+* 名称原样：名单文本直接取自库中行的 env 列。envs 不接收环境名参数，
+  因此不经过 normalize_env()（flagctl.py:48-50 的 strip 只作用于其他
+  命令的 CLI 参数）：不去除两端空白、不折叠内部空白、不转换大小写。
+  "Dev" 与 "dev" 是两个不同名称，分别列出；带空白的名称（如 " Dev"）
+  连同空白原样输出，并按空白自身的码点参与排序。
+* 非 ASCII 原样可见：main 用 json.dumps(..., ensure_ascii=False)
+  （flagctl.py:611），中文等字符直接输出而非 \uXXXX 转义；名称仍由
+  JSON 字符串引号包裹，空白保留在引号内。
+
+实测（库中含 " Dev"/"Dev"/"dev"/"prod"/"ä"/"中" 各有合法 new_ui，
+另有一条 dev 的未知键行制造重名）：
+
+    $ python flagctl.py --db sort.sqlite envs
+    [" Dev", "Dev", "dev", "prod", "ä", "中"]
+
+其中空格（U+0020）码点小于大写字母，故 " Dev" 排在 "Dev" 前；
+大写 D（U+0044）小于小写 d（U+0064）；ä（U+00E4）、中（U+4E2D）
+依次在后；dev 只出现一次。
+
+七、固定样例
+------------
+
+共同前置状态：当前目录（demo.sqlite 的父目录）存在；demo.sqlite 是
+有效 SQLite 库，含标准结构的 flags 表：
+
+    CREATE TABLE flags (
+        env   TEXT NOT NULL,
+        key   TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (env, key)
+    )
+
+样例一：合法记录两条 + 未知键记录一条
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+前置状态：flags 表恰有三行
+
+    ('Dev', 'new_ui',    'true')
+    ('dev', 'new_ui',    'false')
+    ('qa',  'other_key', 'yes')
+
+命令：
+
+    python flagctl.py --db demo.sqlite envs
+
+预期（已按上述前置状态实际运行核对）：
+
+* 退出码 0；stderr 为空；
+* stdout 恰为 `["Dev", "dev"]` 加换行，共 15 个字节：
+
+      ["Dev", "dev"]\n
+
+依据：SELECT 取回三行（cmd_envs，flagctl.py:516）。Dev/new_ui=true
+与 dev/new_ui=false 均为已知键且值为严格文本，stored_bool_text()
+通过（flagctl.py:82-83），两个名称入集——false 与 true 同等合法，dev
+照常出现。qa 只有未知键 other_key，循环在 flagctl.py:526 即 continue，
+其值 "yes" 从不参与校验，qa 不入选。sorted() 按码点序把 "Dev" 排在
+"dev" 前（大写 D 小于小写 d）。main 序列化后加换行输出，退出 0。
+
+样例二：任一环境的合法键出现非法存储值 -> 全库失败
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+前置状态：与样例一相同，仅把 dev 的值从 "false" 换成 "TRUE"：
+
+    ('Dev', 'new_ui',    'true')
+    ('dev', 'new_ui',    'TRUE')
+    ('qa',  'other_key', 'yes')
+
+命令同前：
+
+    python flagctl.py --db demo.sqlite envs
+
+预期（已按上述前置状态实际运行核对）：
+
+* 退出码 2；stdout 为空（0 字节）；
+* stderr 恰为 `STORAGE_ERROR` 加换行：
+
+      STORAGE_ERROR\n
+
+依据：全库扫描命中 dev/new_ui 行，"TRUE" 不满足
+`value == "true" or value == "false"`（flagctl.py:82），
+stored_bool_text() 抛 FlagError("STORAGE_ERROR")（flagctl.py:84），
+经 cmd_envs 向上传播（flagctl.py:528 不在 VALUE_NOT_SET 翻译分支内），
+main 进入 except：写 stderr 并返回 2（flagctl.py:703-705），不执行
+flagctl.py:706 的 stdout 写入。即使 Dev/new_ui=true 本身合法，也不会
+被单独列出——这正是第五节的全库校验范围：不输出 ["Dev"] 这样的部分
+名单。qa 的未知键行依然被跳过，与本次失败无关。
+
+八、空结果与失败边界样例
+------------------------
+
+下表均为同一命令 `python flagctl.py --db <情形> envs`，结果已逐项实际
+运行核对；“统一协议”指成功时 stdout 单行加换行、stderr 空、退出 0，
+失败时 stdout 空、stderr 仅错误码加换行、退出 2。
+
+前置状态                                  stdout   stderr         退出码  依据
+----------------------------------------  -------  -------------  ------  ----
+父目录存在，库文件缺失                     []\n     （空）         0       open_flag_store
+                                                                       flagctl.py:105-109
+                                                                       ->VALUE_NOT_SET；
+                                                                       cmd_envs:519-520
+有效库存在但无 flags 表                    []\n     （空）         0       OperationalError
+                                                                       "no such table"
+                                                                       flagctl.py:116-117
+flags 表存在但只有未知键记录               []\n     （空）         0       循环全部
+（如 qa/other_key=yes）                                                    continue
+                                                                       flagctl.py:526-527
+flags 表为空                               []\n     （空）         0       集合为空，
+                                                                       sorted(set())
+零字节文件                                 []\n     （空）         0       SQLite 视为空库，
+                                                                       查询报 no such table
+父目录缺失（nodir/x.sqlite，nodir 不存在） （空）   STORAGE_ERROR  2       flagctl.py:107-108
+无效库（文件内容为非 SQLite 字节）          （空）   STORAGE_ERROR  2       connect/查询
+                                                                       sqlite3.Error
+                                                                       flagctl.py:87-91、
+                                                                       119-120
+--db 路径是一个已存在的目录                （空）   STORAGE_ERROR  2       connect() 抛错
+                                                                       flagctl.py:89-91
+flags 表缺 env、key 或 value 中任一所需列   （空）   STORAGE_ERROR  2       "no such column"
+                                                                       不走 no-such-table
+                                                                       分支 flagctl.py:114-118
+任一环境 new_ui 值非法（样例二）           （空）   STORAGE_ERROR  2       stored_bool_text
+                                                                       flagctl.py:82-84
+
+连接或查询在运行时因其他 sqlite3.Error 失败的情形（推导预期，未逐一
+构造）：同样落入 flagctl.py:119-120 的兜底分支，按统一协议报
+STORAGE_ERROR、退出 2、stdout 为空。
+
+以上所有读取都不创建目录、库文件或表，也不修复记录；得到 [] 的三种
+正面情形（库文件缺失但父目录在、缺 flags 表、无合法键记录）与得到
+STORAGE_ERROR 的情形共用同一套错误输出形状，区别只在退出码与流。
+
+九、源码依据索引
+----------------
+
+* build_parser()：envs 子命令无位置参数（flagctl.py:587）；--db 必填
+  （flagctl.py:537）。
+* main()：envs 分支在最前，直接 json.dumps(cmd_envs(args.db),
+  ensure_ascii=False)（flagctl.py:609-611）；FlagError 统一处理为
+  stderr 错误码加换行、返回 EXIT_ERROR=2（flagctl.py:703-705）；成功
+  stdout 写结果加换行、返回 EXIT_OK=0（flagctl.py:706-707、26-28）。
+* cmd_envs()（flagctl.py:497-530）：open_flag_store 内执行无 WHERE 的
+  SELECT env, key, value FROM flags（516）；VALUE_NOT_SET 翻译为 []、
+  其余上抛（517-521）；未知键 continue（526-527）；已知键经
+  stored_bool_text() 校验后 envs.add(env)（528-529）；返回
+  sorted(envs)（530）。
+* open_flag_store()（flagctl.py:94-122）：库文件缺失按父目录区分
+  STORAGE_ERROR / VALUE_NOT_SET（105-109）；缺 flags 表 ->
+  VALUE_NOT_SET（114-117）；连接与其他 sqlite3.Error（无效库、所需列
+  缺失等）-> STORAGE_ERROR（87-91、119-120）。全程不建表、不创建文件。
+* stored_bool_text()（flagctl.py:71-84）：唯一的已保存值校验，只接受
+  严格文本 "true"/"false"，否则 STORAGE_ERROR；get/list/envs 共用这
+  一份。
+* KNOWN_KEYS（flagctl.py:24）：当前仅 {"new_ui"}，决定“合法直接设置”
+  的键范围。
+* SCHEMA（flagctl.py:30-37）：flags(env, key, value)，主键
+  (env, key)；envs 为只读流程，不执行该 SCHEMA。
