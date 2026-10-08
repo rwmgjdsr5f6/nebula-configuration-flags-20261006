@@ -1,0 +1,235 @@
+get 读取流程：直接设置、临时默认值与来源标注（flagctl.py）
+==========================================================
+
+本文只整理一条已有流程：README“命令一览”中的 get 命令如何把一次读取
+从命令入口走到最终输出，包括环境名处理、输入校验、存储读取、来源判定
+与输出协议。公开命令、输出协议与现有 SQLite 数据格式均保持不变；
+flagctl 不增加持久化默认值（--default 只作用于本次读取、不落库），也
+没有环境继承：键缺失就只表示“没有直接设置”，不会从其他环境或内置
+配置补值。
+
+文中关键结论均注明 flagctl.py 中对应的函数名或 main() 分支，可直接与
+源码核对。文中样例是“由源码推导的预期”，并标注 test_flagctl.py 中
+对应的已有测试案例；本文不声称这些命令已经实际执行或实测通过。
+
+命令入口（README“命令一览”）：
+
+    python flagctl.py --db <库> get <环境> <键> [--default true|false] [--explain]
+
+整体阶段顺序（下文逐节展开）：
+
+  1. 环境名处理：normalize_env() 去除两端空白；
+  2. 输入校验：validate_env() -> validate_key() -> parse_bool()，
+     全部通过后才访问存储；
+  3. 存储读取：read_flag_with_source() 经 open_flag_store() 打开库并
+     SELECT 目标行，再由 stored_bool_text() 校验值；
+  4. 来源判定：合法已保存记录为 direct；目标未设置且本次给了合法默认
+     值才为 default；
+  5. 输出：cmd_get() 返回布尔文本，cmd_get_explained() 返回
+     {"value": .., "source": ..}，由 main() 统一加换行写出。
+
+
+1. 环境名处理：去两端空白、留内部空白、区分大小写
+--------------------------------------------------
+
+main() 在进入 get 分支后第一件事是
+env = normalize_env(args.env)（normalize_env()，仅做 env.strip()），
+随后 validate_env(env) 校验去空白后的结果：
+
+* 只去除两端空白；内部空白原样保留。"  de v  " 规范化为 "de v"，
+  与保存时按同样规则写入的 "de v" 行精确匹配；
+* 区分大小写，"Dev" 与 "dev" 是两个互不相同的环境，SQL 以参数化
+  字符串精确比较，不做大小写折叠；
+* 空串或全空白环境名规范化后为空，validate_env() 报 EMPTY_ENV。
+
+注意：只对环境名做 strip。键名不修剪、不转换大小写，必须严格等于
+new_ui（见第 2 节）。
+
+
+2. 输入校验：环境名 -> 键名 -> 默认值，且先于一切存储访问
+----------------------------------------------------------
+
+get 的校验全部在 main() 的 get 分支（解析 --default、分发
+cmd_get()/cmd_get_explained() 之前的 else 分支）完成，严格按以下
+顺序，任一失败都在触碰数据库之前拒绝：
+
+(1) 环境名：normalize_env() 后 validate_env()，为空（含全空白）报
+    EMPTY_ENV；
+(2) 键名：validate_key(args.key) 对照 KNOWN_KEYS（当前仅
+    frozenset({"new_ui"})），不是 new_ui 一律报 UNKNOWN_KEY——
+    " new_ui "、"New_UI" 等也算未知键；
+(3) 默认值：仅当命令行给了 --default（args.default 不是 None）时调用
+    parse_bool()。parse_bool() 只接受严格小写文本 "true" / "false"：
+    空串、"TRUE"、"1"、"yes"、" false "、"true " 等一律报
+    INVALID_BOOL，不做大小写或空白容错。省略 --default 时默认值为
+    None，不触发这一步，也不会报 INVALID_BOOL。
+
+即使目标 (环境, 键) 已存在合法记录，默认值校验也不跳过：main() 先
+parse_bool() 再调用 cmd_get*()，所以“记录已保存”不能让一个非法的
+--default 蒙混过关（对应测试
+TestGetExplain.test_invalid_default_rejected_even_with_saved_value，
+以及不带 --explain 的
+TestGetDefaultValidationBeforeStorage）。
+
+任何输入校验失败都不创建目录、库文件或表，也不读取或修改记录；失败
+协议见第 5 节。
+
+
+3. 存储读取：open_flag_store() 的状态分类与单行 SELECT
+-------------------------------------------------------
+
+校验全部通过后，cmd_get() 与 cmd_get_explained() 都调用同一个底层
+函数 read_flag_with_source()，它通过 open_flag_store() 访问存储。
+get 全程只读：open_flag_store() 不执行任何建库/建表语句，存储状态
+分类只在这一个上下文管理器里维护一份：
+
+* 库文件不存在（os.path.exists 为假）：
+  - 取库路径的绝对父目录，os.path.isdir 为假（父目录缺失）->
+    STORAGE_ERROR；
+  - 父目录存在、仅库文件缺失 -> VALUE_NOT_SET（语义：没有任何已保存
+    的值，而不是损坏）；
+* 库文件存在：connect()（sqlite3.connect）失败 -> STORAGE_ERROR；
+  成功后在其中执行
+  SELECT value FROM flags WHERE env = ? AND key = ?，参数为规范化后
+  的环境名与原键名：
+  - 查询抛 OperationalError 且信息含 "no such table"（有效库缺
+    flags 表）-> VALUE_NOT_SET，不补建表；
+  - 其他 sqlite3 错误，包括查询所需列缺失（如 flags 表没有 value
+    列，报 "no such column"）、连接后查询失败等 -> STORAGE_ERROR；
+  - 连接/查询结束后连接在 finally 中关闭。
+
+查询结果再分两种：
+
+* row is None：目标 (环境, 键) 记录不存在（含库里只有其他环境或其他
+  键的行），属于“未设置”；
+* row 存在：值交给 stored_bool_text()——这是 get/list/envs（及经
+  list 的 diff）共用的唯一一份已保存值校验：值必须严格等于文本
+  "true" 或 "false"，原样返回；不修剪空白、不转换大小写，任何其他
+  值（"yes"、"1"、"TRUE"、空串等）都按存储数据损坏报 STORAGE_ERROR。
+
+SELECT 以 (env, key) 主键精确过滤，读取范围只有目标这一行：其他环境
+的记录、未知键（不在 KNOWN_KEYS 内）的行根本不会被读到，因此它们
+即使保存了异常值也不影响目标读取（对应测试
+TestGetExplain.test_anomalies_in_other_env_and_unknown_key_do_not_affect_explain，
+以及 TestGetStoredValueValidation.test_invalid_value_in_other_env_does_not_affect_target）。
+
+
+4. 来源判定：direct 与 default 的唯一规则
+-----------------------------------------
+
+来源只在 read_flag_with_source() 中判定，get 与 get --explain 共用，
+返回 (严格文本 "true"/"false", 来源)：
+
+* 目标行存在且值通过 stored_bool_text()：返回 (保存值, "direct")。
+  已保存的 false 是有效直接设置，照常返回 false 并标 direct，不会被
+  解释成“未设置”；即使 --default 给的值与保存值相同（false 配
+  --default false，或 true 配 --default true），来源仍然是 direct。
+  对应 TestGetExplain.test_saved_true_and_false_both_direct 与
+  TestGetDefaultPrefersSavedValue.test_saved_false_returned_even_with_true_default。
+* 目标没有直接设置，且本次提供了合法默认值（default 不是 None）：
+  返回 (默认值, "default")。默认值只在两处“未设置”信号上兜底：
+  - open_flag_store() 抛 VALUE_NOT_SET 时（父目录存在但库文件缺失、
+    有效库缺 flags 表），read_flag_with_source() 的 except FlagError
+    分支判断 exc.code == "VALUE_NOT_SET" 且 default is not None；
+  - SELECT 返回 row is None（目标记录缺失）后的分支。
+  对应测试
+  TestGetExplain.test_unset_states_with_default_report_default_without_side_effects
+  与 TestGetDefaultOnUnsetStates。
+* 目标没有直接设置且未提供默认值（default 为 None）：上述两处都抛
+  VALUE_NOT_SET。对应
+  TestGetExplain.test_unset_state_without_default_reports_value_not_set。
+* STORAGE_ERROR 不允许默认值兜底：父目录缺失、无效库、所需列缺失、
+  连接或查询失败、目标值不是严格文本 true/false 时，异常原样向上
+  抛出，即使给了合法 --default 也仍报 STORAGE_ERROR。对应
+  TestGetExplain.test_storage_errors_not_masked_by_default 与
+  TestGetDefaultValidationBeforeStorage 中的同名场景测试。
+
+默认值是本次调用的临时入参，既不写入 flags 表，也不影响其他环境或
+后续命令；环境之间相互独立，不存在继承。
+
+
+5. 输出：布尔文本或 value/source JSON，错误协议不变
+---------------------------------------------------
+
+成功（退出码 EXIT_OK = 0，stderr 为空，stdout 单行加换行 "\n"）：
+
+* 省略 --explain：main() 调用 cmd_get()，它丢弃来源、只返回严格文本
+  "true"/"false"，main() 写出该文本加换行。这与 --default/--explain
+  引入前的 get 完全一致（对应
+  TestGetExplain.test_without_explain_flag_keeps_plain_bool_output）。
+* 附加 --explain：main() 调用 cmd_get_explained()，它把文本映射为
+  JSON 布尔值（text == "true"），返回仅含两个字段的对象
+  {"value": 布尔值, "source": "direct" 或 "default"}；main() 用
+  json.dumps(..., separators=(",", ":")) 序列化为紧凑单行，例如
+  {"value":false,"source":"direct"}，再加换行写出，不输出其他字段。
+
+失败（main() 的 except FlagError 分支）：退出码 EXIT_ERROR = 2；
+stdout 为空；stderr 仅为错误码加换行（sys.stderr.write(exc.code +
+"\n")），如 VALUE_NOT_SET\n、STORAGE_ERROR\n、EMPTY_ENV\n、
+UNKNOWN_KEY\n、INVALID_BOOL\n，不附带其他文本。--explain 只改变成功
+时的 stdout 形状：校验顺序、错误码、退出码、stdout/stderr 分工与不带
+--explain 完全一致。
+
+
+6. 固定样例（源码推导的预期，非实测结果）
+-----------------------------------------
+
+前置状态（固定）：
+
+* demo.sqlite 所在父目录已经存在；
+* demo.sqlite 是有效 SQLite 库，含 flags 表，表中仅有一行
+  (env='dev', key='new_ui', value='false')；
+* 环境 qa 在 flags 表中没有任何记录。
+
+flags 表结构不变：flags(env TEXT, key TEXT, value TEXT,
+PRIMARY KEY (env, key))。
+
+第一次读取（已保存 false，默认值与保存值不同也不影响来源）：
+
+    python flagctl.py --db demo.sqlite get dev new_ui --default true --explain
+
+预期：退出码 0；stderr 为空；stdout 仅一行紧凑 JSON 加换行：
+
+    {"value":false,"source":"direct"}
+
+第二次读取，把环境名 dev 换成 qa（目标无记录，使用本次默认值）：
+
+    python flagctl.py --db demo.sqlite get qa new_ui --default true --explain
+
+预期：退出码 0；stderr 为空；stdout 仅一行紧凑 JSON 加换行：
+
+    {"value":true,"source":"default"}
+
+这两步与测试
+TestGetExplain.test_fixed_sample_direct_false_and_default_true 中的
+验收样例完全对应（该测试在临时库中先 set dev new_ui false，再分别对
+dev、qa 执行带 --default true 的 --explain 读取）。
+
+同一前置状态下的相邻预期：
+
+* 省略 --explain：get dev new_ui --default true 输出单行 false；
+  get qa new_ui --default true 输出单行 true（布尔文本而非 JSON）；
+* qa 不带默认值：get qa new_ui 失败——退出 2、stdout 为空、stderr
+  仅 VALUE_NOT_SET 加换行；
+* dev 的非法默认值（如 --default TRUE）即使记录存在也先报
+  INVALID_BOOL，退出 2、stdout 为空。
+
+以上输出均为按 flagctl.py 源码与既有测试推导的预期，本文未实际执行
+这些命令，不把它们表述为实测结果。
+
+
+7. 只读副作用边界
+-----------------
+
+两次样例读取（以及任何 get / get --explain）：
+
+* 不创建父目录、库文件或 flags 表：父目录存在但库文件缺失时读取后
+  文件仍不存在；有效库缺 flags 表时读取后表仍不存在（open_flag_store()
+  只 SELECT，建库建表只发生在 set 与非空 import 共用的
+  save_flags() 中）；
+* 不修改、不修复任何记录：stored_bool_text() 对非法值只报错，不回写；
+  样例读取后 demo.sqlite 中仍只有 dev/new_ui=false 这一行，qa 不会
+  新增记录；
+* --default 提供的值不落库：随后省略 --default 再读 qa 仍报
+  VALUE_NOT_SET，即证明 true 只是本次读取的临时结果；
+* 不访问网络、不经过进程内缓存，重复读取得到相同结果。
